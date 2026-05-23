@@ -1,0 +1,33 @@
+{
+  "name": "oira666_pi-ssh-remote",
+  "version": "0.1.0",
+  "description": "Pi extension that transparently runs core tools on a selected SSH remote project.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gee666/pi-ssh-remote.git"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "ssh",
+    "remote"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.75.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

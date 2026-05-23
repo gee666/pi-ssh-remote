@@ -1,0 +1,4 @@
+.agent-task.md
+tmp/
+node_modules/
+*.tgz
