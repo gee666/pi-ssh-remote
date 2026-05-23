@@ -3,4 +3,4 @@ dist/
 .tmp/
 tmp/
 *.tgz
-.agent-task.md
+.agent-*.md

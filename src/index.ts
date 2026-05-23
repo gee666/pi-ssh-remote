@@ -70,6 +70,8 @@ const RESET = "\u001b[0m";
 const DEFAULT_SSH_TIMEOUT_MS = 120_000;
 const STARTUP_PROBE_TIMEOUT_MS = 20_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
+const INHERITED_PROJECT_ENV = "PI_CODING_AGENT_SSH_REMOTE_PROJECT";
+const PROJECT_ENV_DELIMITER = "::";
 
 class FriendlySshError extends Error {
 	constructor(
@@ -95,6 +97,14 @@ function truncateMiddle(value: string, max = 110): string {
 	const left = Math.ceil((max - 3) / 2);
 	const right = Math.floor((max - 3) / 2);
 	return `${value.slice(0, left)}...${value.slice(value.length - right)}`;
+}
+
+function isPrintModeArgv(argv = process.argv): boolean {
+	return argv.slice(2).some((arg) => arg === "-p" || arg === "--print" || arg.startsWith("--print="));
+}
+
+function formatInheritedProject(project: RemoteProject): string {
+	return `${project.serverName}${PROJECT_ENV_DELIMITER}${project.project.path}`;
 }
 
 function redError(message: string): void {
@@ -503,6 +513,38 @@ async function loadProjects(): Promise<RemoteProject[]> {
 	return projects;
 }
 
+function matchExactProject(projects: RemoteProject[], serverName: string, projectPath: string): RemoteProject | undefined {
+	return projects.find((entry) => entry.serverName === serverName && entry.project.path === projectPath);
+}
+
+function matchInheritedProject(projects: RemoteProject[], wanted: string): RemoteProject | undefined {
+	const trimmed = wanted.trim();
+	if (!trimmed) return undefined;
+
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		const obj = asObject(parsed);
+		const serverName = obj?.serverName ?? obj?.server ?? obj?.serverId;
+		const projectPath = obj?.projectPath ?? obj?.path;
+		if (typeof serverName === "string" && typeof projectPath === "string") {
+			const match = matchExactProject(projects, serverName, projectPath);
+			if (match) return match;
+		}
+	} catch {
+		// Not JSON; try the compact delimiter form below.
+	}
+
+	const delimiterIndex = trimmed.indexOf(PROJECT_ENV_DELIMITER);
+	if (delimiterIndex > 0) {
+		const serverName = trimmed.slice(0, delimiterIndex);
+		const projectPath = trimmed.slice(delimiterIndex + PROJECT_ENV_DELIMITER.length);
+		const match = matchExactProject(projects, serverName, projectPath);
+		if (match) return match;
+	}
+
+	return matchProject(projects, trimmed);
+}
+
 function matchProject(projects: RemoteProject[], wanted: string): RemoteProject | undefined {
 	const needle = wanted.toLowerCase();
 	return projects.find((entry, index) => {
@@ -520,6 +562,13 @@ async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext): Promise<R
 	const projects = await loadProjects();
 	if (projects.length === 0) {
 		throw new Error(`SSH remote settings were not found. Add at least one server and project to ${CONFIG_PATH}.`);
+	}
+
+	const inheritedRequested = process.env[INHERITED_PROJECT_ENV];
+	if (inheritedRequested) {
+		const match = matchInheritedProject(projects, inheritedRequested);
+		if (!match) throw new Error(`SSH remote project '${inheritedRequested}' from ${INHERITED_PROJECT_ENV} was not found in ${CONFIG_PATH}.`);
+		return match;
 	}
 
 	const requested = (pi.getFlag("ssh-remote-project") as string | undefined) ?? process.env.PI_SSH_REMOTE_PROJECT ?? process.env.SSH_REMOTE_PROJECT;
@@ -566,11 +615,14 @@ export default function piSshRemote(pi: ExtensionAPI) {
 	const localCwd = process.cwd();
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!pi.getFlag("ssh-remote")) return;
+		const inheritedProject = process.env[INHERITED_PROJECT_ENV];
+		const enabledByFlag = pi.getFlag("ssh-remote") === true && (!isPrintModeArgv() || !!inheritedProject);
+		if (!enabledByFlag && !inheritedProject) return;
 
 		try {
 			fatalStartupError = null;
 			const project = await selectProject(pi, ctx);
+			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject(project);
 			await checkLocalPrerequisites(project.server);
 			const ssh = buildSsh(project.serverName, project.server);
 			const remote: ActiveRemote = {
@@ -598,7 +650,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 	});
 
 	pi.on("input", () => {
-		if (!pi.getFlag("ssh-remote") || !fatalStartupError) return { action: "continue" };
+		if (!(pi.getFlag("ssh-remote") || process.env[INHERITED_PROJECT_ENV]) || !fatalStartupError) return { action: "continue" };
 		process.exitCode = 1;
 		return { action: "handled" };
 	});
