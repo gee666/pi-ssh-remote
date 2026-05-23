@@ -24,7 +24,7 @@ Select a configured project explicitly:
 pi --ssh-remote --ssh-remote-project "My project"
 ```
 
-`--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. In non-UI modes that are not inline/print mode, either configure exactly one project or pass `--ssh-remote-project`. You can also set `PI_SSH_REMOTE_PROJECT` or `SSH_REMOTE_PROJECT`.
+`--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. In non-UI modes that are not inline/print mode, either configure exactly one project, pass `--ssh-remote-project`, or set `PI_CODING_AGENT_SSH_REMOTE_PROJECT`.
 
 For subprocesses and subagents, the extension exports the selected project as:
 
@@ -64,17 +64,34 @@ Each top-level key is a server name. Server fields can use SSH config aliases or
 - `user` / `User`
 - `port` / `Port`
 - `identityFile` / `IdentityFile`
+- `password` / `Password` (requires local `sshpass`; prefer `passwordEnv`)
+- `passwordEnv` / `PasswordEnv` (name of an environment variable containing the password; requires local `sshpass`)
 - `identitiesOnly` / `IdentitiesOnly`
 - `sshOptions` object for additional `-o key=value` options
 - `projects`: array of `{ "title": string, "path": string }`
 
 If `host` is omitted, the server name is used as the SSH target, which works well with entries in `~/.ssh/config`.
 
+Password authentication is supported when `sshpass` is installed locally. To avoid storing a password in the config file, use `passwordEnv`:
+
+```json
+{
+  "example": {
+    "hostName": "example.com",
+    "user": "deploy",
+    "passwordEnv": "PI_CODING_AGENT_SSH_REPOTE_PASSWORD",
+    "projects": [{ "title": "App", "path": "/var/www/app" }]
+  }
+}
+```
+
+Then start pi with `PI_CODING_AGENT_SSH_REPOTE_PASSWORD='your password' pi --ssh-remote`. Host-key verification still applies; connect once manually with `ssh example.com` if the host is not in `known_hosts` yet.
+
 ## Behavior
 
 When `--ssh-remote` is not set and `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is not set, the extension only registers its flags and does not override any tools.
 
-When enabled, pi prompts for a configured project in UI mode, checks the local SSH client/key, probes the remote connection and project directory, exports `PI_CODING_AGENT_SSH_REMOTE_PROJECT` for child processes, registers remote-backed replacements for `read`, `write`, `edit`, and `bash`, routes user `!` shell commands over SSH, and rewrites the system prompt working directory to the remote project path.
+When enabled, pi prompts for a configured project in UI mode, checks the local SSH client and configured key/password prerequisites, probes the remote connection and project directory, exports `PI_CODING_AGENT_SSH_REMOTE_PROJECT` for child processes, registers remote-backed replacements for `read`, `write`, `edit`, and `bash`, routes user `!` shell commands over SSH, and rewrites the system prompt working directory to the remote project path.
 
 The extension fails closed: if config, authentication, host-key verification, network access, or the remote project path is invalid, pi displays a readable red error and does not let the agent continue as if it were connected.
 
@@ -83,8 +100,10 @@ The extension fails closed: if config, authentication, host-key verification, ne
 The extension classifies common SSH failures into actionable messages:
 
 - missing local `ssh` command
+- missing local `sshpass` command when password auth is configured
+- unset password environment variable
 - unreadable `IdentityFile`
-- authentication/public-key failure
+- authentication/public-key/password failure
 - host-key verification failure
 - DNS/host typo
 - connection refused or timeout

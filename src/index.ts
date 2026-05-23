@@ -31,6 +31,10 @@ type ServerConfig = {
 	Port?: number | string;
 	identityFile?: string;
 	IdentityFile?: string;
+	password?: string;
+	Password?: string;
+	passwordEnv?: string;
+	PasswordEnv?: string;
 	identitiesOnly?: boolean | string;
 	IdentitiesOnly?: boolean | string;
 	sshOptions?: Record<string, string | number | boolean>;
@@ -49,8 +53,10 @@ type RemoteProject = {
 type ActiveRemote = {
 	project: RemoteProject;
 	remoteCwd: string;
+	sshCommand: string;
 	sshArgs: string[];
 	target: string;
+	sshEnv?: Record<string, string>;
 	consecutiveFailures: number;
 	lastFailure?: string;
 };
@@ -121,6 +127,20 @@ function isBoolString(value: string): boolean {
 	return ["yes", "true", "1", "no", "false", "0"].includes(value.toLowerCase());
 }
 
+function getConfiguredPassword(server: ServerConfig): { password: string; source: "config" | "env" } | undefined {
+	const passwordEnv = server.passwordEnv ?? server.PasswordEnv;
+	if (passwordEnv) {
+		const password = process.env[passwordEnv];
+		if (password !== undefined) return { password, source: "env" };
+	}
+	const password = server.password ?? server.Password;
+	return password !== undefined ? { password, source: "config" } : undefined;
+}
+
+function hasPasswordSetting(server: ServerConfig): boolean {
+	return (server.password ?? server.Password ?? server.passwordEnv ?? server.PasswordEnv) !== undefined;
+}
+
 function asObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
@@ -140,7 +160,7 @@ function validateConfig(value: unknown): ConfigFile {
 		}
 
 		const server = serverObj as ServerConfig;
-		for (const field of ["host", "Host", "hostName", "HostName", "user", "User", "identityFile", "IdentityFile"] as const) {
+		for (const field of ["host", "Host", "hostName", "HostName", "user", "User", "identityFile", "IdentityFile", "password", "Password", "passwordEnv", "PasswordEnv"] as const) {
 			if (server[field] !== undefined && typeof server[field] !== "string") {
 				throw new Error(`SSH remote server '${serverName}' has invalid '${field}': expected a string.`);
 			}
@@ -187,6 +207,22 @@ async function checkLocalPrerequisites(server: ServerConfig): Promise<void> {
 		throw new FriendlySshError("The local 'ssh' command was not found. Install OpenSSH client and try again.", "missing-ssh", false);
 	}
 
+	if (hasPasswordSetting(server)) {
+		const passwordEnv = server.passwordEnv ?? server.PasswordEnv;
+		if (passwordEnv && process.env[passwordEnv] === undefined) {
+			throw new FriendlySshError(`SSH password environment variable '${passwordEnv}' is not set. Export it or remove passwordEnv in ${CONFIG_PATH}.`, "auth", false);
+		}
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const child = spawn("sshpass", ["-V"], { stdio: "ignore" });
+				child.on("error", reject);
+				child.on("close", () => resolve());
+			});
+		} catch {
+			throw new FriendlySshError("Password SSH auth requires the local 'sshpass' command. Install sshpass, or use an SSH key/agent instead.", "missing-ssh", false);
+		}
+	}
+
 	const identityFile = server.identityFile ?? server.IdentityFile;
 	if (!identityFile) return;
 	const expanded = expandHome(identityFile);
@@ -197,23 +233,25 @@ async function checkLocalPrerequisites(server: ServerConfig): Promise<void> {
 	}
 }
 
-function buildSsh(serverName: string, server: ServerConfig): { args: string[]; target: string } {
+function buildSsh(serverName: string, server: ServerConfig): { command: string; args: string[]; target: string; env?: Record<string, string> } {
 	const host = server.host ?? server.Host ?? server.hostName ?? server.HostName ?? serverName;
 	const user = server.user ?? server.User;
 	const port = server.port ?? server.Port;
 	const identityFile = server.identityFile ?? server.IdentityFile;
 	const identitiesOnly = normalizeBool(server.identitiesOnly ?? server.IdentitiesOnly);
+	const passwordAuth = getConfiguredPassword(server);
 	const target = user ? `${user}@${host}` : host;
-	const args: string[] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
+	const sshArgs: string[] = ["-o", `BatchMode=${passwordAuth ? "no" : "yes"}`, "-o", "ConnectTimeout=10"];
 
-	if (port !== undefined && String(port).trim() !== "") args.push("-p", String(port));
-	if (identityFile) args.push("-i", expandHome(identityFile));
-	if (identitiesOnly !== undefined) args.push("-o", `IdentitiesOnly=${identitiesOnly ? "yes" : "no"}`);
+	if (port !== undefined && String(port).trim() !== "") sshArgs.push("-p", String(port));
+	if (identityFile) sshArgs.push("-i", expandHome(identityFile));
+	if (identitiesOnly !== undefined) sshArgs.push("-o", `IdentitiesOnly=${identitiesOnly ? "yes" : "no"}`);
 	for (const [key, value] of Object.entries(server.sshOptions ?? {})) {
-		args.push("-o", `${key}=${String(value)}`);
+		sshArgs.push("-o", `${key}=${String(value)}`);
 	}
 
-	return { args, target };
+	if (!passwordAuth) return { command: "ssh", args: sshArgs, target };
+	return { command: "sshpass", args: ["-e", "ssh", ...sshArgs], target, env: { SSHPASS: passwordAuth.password } };
 }
 
 function classifySshFailure(stderr: string, code: number | null, timedOut: boolean, spawnError: unknown, purpose: string): FriendlySshError {
@@ -292,9 +330,13 @@ async function sshExecBuffer(remote: ActiveRemote, command: string, options: Ssh
 	throw lastError ?? new FriendlySshError(`SSH failed while trying to ${options.purpose}.`, "unknown", false);
 }
 
+function sshSpawnEnv(remote: ActiveRemote): NodeJS.ProcessEnv | undefined {
+	return remote.sshEnv ? { ...process.env, ...remote.sshEnv } : undefined;
+}
+
 function runSshOnce(remote: ActiveRemote, command: string, options: SshExecOptions & { timeoutMs: number }): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const child = spawn("ssh", [...remote.sshArgs, remote.target, command], { stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+		const child = spawn(remote.sshCommand, [...remote.sshArgs, remote.target, command], { stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"], env: sshSpawnEnv(remote) });
 		const chunks: Buffer[] = [];
 		const errChunks: Buffer[] = [];
 		let timedOut = false;
@@ -435,7 +477,7 @@ function runRemoteBashOnce(
 	return new Promise((resolve, reject) => {
 		const remoteScript = `cd ${shellQuote(effectiveCwd)} && ${command}`;
 		const remoteCommand = `bash -lc ${shellQuote(remoteScript)}`;
-		const child = spawn("ssh", [...remote.sshArgs, remote.target, remoteCommand], { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(remote.sshCommand, [...remote.sshArgs, remote.target, remoteCommand], { stdio: ["ignore", "pipe", "pipe"], env: sshSpawnEnv(remote) });
 		const errChunks: Buffer[] = [];
 		let sawStdout = false;
 		let timedOut = false;
@@ -571,7 +613,7 @@ async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext): Promise<R
 		return match;
 	}
 
-	const requested = (pi.getFlag("ssh-remote-project") as string | undefined) ?? process.env.PI_SSH_REMOTE_PROJECT ?? process.env.SSH_REMOTE_PROJECT;
+	const requested = pi.getFlag("ssh-remote-project") as string | undefined;
 	if (requested) {
 		const match = matchProject(projects, requested);
 		if (!match) throw new Error(`SSH remote project '${requested}' was not found in ${CONFIG_PATH}.`);
@@ -581,7 +623,7 @@ async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext): Promise<R
 	if (projects.length === 1 || !ctx.hasUI) {
 		if (projects.length === 1) return projects[0];
 		throw new Error(
-			`Multiple SSH remote projects are configured. In non-interactive mode set --ssh-remote-project, PI_SSH_REMOTE_PROJECT, or SSH_REMOTE_PROJECT.`,
+			`Multiple SSH remote projects are configured. In non-interactive mode set --ssh-remote-project or ${INHERITED_PROJECT_ENV}.`,
 		);
 	}
 
@@ -628,8 +670,10 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			const remote: ActiveRemote = {
 				project,
 				remoteCwd: project.project.path,
+				sshCommand: ssh.command,
 				sshArgs: ssh.args,
 				target: ssh.target,
+				sshEnv: ssh.env,
 				consecutiveFailures: 0,
 			};
 			await probeRemote(remote);
