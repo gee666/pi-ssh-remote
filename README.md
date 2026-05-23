@@ -43,15 +43,15 @@ Create `~/.pi/agent/ssh-remote-config.json`:
 ```json
 {
   "artlin6-dance": {
-    "hostName": "205.134.255.228",
-    "user": "artlin6",
-    "port": 2222,
-    "identityFile": "~/.ssh/dance_alchemy_key",
+    "hostName": "<your host>",
+    "user": "<your user>",
+    "port": <ssh port>,
+    "identityFile": "<path to the ssh key file>",
     "identitiesOnly": true,
     "projects": [
       {
-        "title": "Safe temp project",
-        "path": "/tmp/pi-ssh-remote-test"
+        "title": "Your project title",
+        "path": "/remote/project/path"
       }
     ]
   }
