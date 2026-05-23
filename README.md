@@ -4,19 +4,27 @@
 
 The extension is intentionally inert unless pi is started with `--ssh-remote`.
 
+## Installation
+
+```bash
+pi install npm:oira666_pi-ssh-remote
+```
+
 ## Usage
 
-```bash
-pi -e . --ssh-remote
-```
-
-In print/non-UI mode, either configure exactly one project or select one explicitly:
+Start pi in SSH remote mode:
 
 ```bash
-pi -ne -e . --ssh-remote --ssh-remote-project "My project" -p "pwd"
+pi --ssh-remote
 ```
 
-`--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. You can also set `PI_SSH_REMOTE_PROJECT` or `SSH_REMOTE_PROJECT`.
+Select a configured project explicitly:
+
+```bash
+pi --ssh-remote --ssh-remote-project "My project"
+```
+
+`--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. In print/non-UI mode, either configure exactly one project or pass `--ssh-remote-project`. You can also set `PI_SSH_REMOTE_PROJECT` or `SSH_REMOTE_PROJECT`.
 
 ## Configuration
 
