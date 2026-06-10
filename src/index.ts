@@ -75,6 +75,8 @@ const RED = "\u001b[31m";
 const RESET = "\u001b[0m";
 const DEFAULT_SSH_TIMEOUT_MS = 120_000;
 const STARTUP_PROBE_TIMEOUT_MS = 20_000;
+const DEFAULT_SSH_RETRIES = 2;
+const BASH_SSH_RETRIES = 2;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const INHERITED_PROJECT_ENV = "PI_CODING_AGENT_SSH_REMOTE_PROJECT";
 const PROJECT_ENV_DELIMITER = "::";
@@ -241,7 +243,18 @@ function buildSsh(serverName: string, server: ServerConfig): { command: string; 
 	const identitiesOnly = normalizeBool(server.identitiesOnly ?? server.IdentitiesOnly);
 	const passwordAuth = getConfiguredPassword(server);
 	const target = user ? `${user}@${host}` : host;
-	const sshArgs: string[] = ["-o", `BatchMode=${passwordAuth ? "no" : "yes"}`, "-o", "ConnectTimeout=10"];
+	const sshArgs: string[] = [
+		"-o",
+		`BatchMode=${passwordAuth ? "no" : "yes"}`,
+		"-o",
+		"ConnectTimeout=10",
+		"-o",
+		"ConnectionAttempts=3",
+		"-o",
+		"ServerAliveInterval=15",
+		"-o",
+		"ServerAliveCountMax=3",
+	];
 
 	if (port !== undefined && String(port).trim() !== "") sshArgs.push("-p", String(port));
 	if (identityFile) sshArgs.push("-i", expandHome(identityFile));
@@ -276,8 +289,18 @@ function classifySshFailure(stderr: string, code: number | null, timedOut: boole
 	if (lower.includes("connection refused")) {
 		return new FriendlySshError(`SSH connection was refused. Check that sshd is running and the configured port is correct.${suffix}`, "connection", true);
 	}
-	if (lower.includes("connection timed out") || lower.includes("operation timed out") || lower.includes("no route to host") || lower.includes("network is unreachable")) {
-		return new FriendlySshError(`SSH could not reach the server. Check network, VPN, firewall, host, and port.${suffix}`, "connection", true);
+	if (
+		lower.includes("connection timed out") ||
+		lower.includes("operation timed out") ||
+		lower.includes("no route to host") ||
+		lower.includes("network is unreachable") ||
+		lower.includes("connection closed") ||
+		lower.includes("connection reset") ||
+		lower.includes("broken pipe") ||
+		lower.includes("kex_exchange_identification") ||
+		lower.includes("banner exchange")
+	) {
+		return new FriendlySshError(`SSH connection was interrupted. The operation can usually be retried once the network/server is reachable again.${suffix}`, "connection", true);
 	}
 	if (lower.includes("__pi_remote_path_missing__")) {
 		return new FriendlySshError(`The configured remote project path does not exist or is not a directory. Update the project path in ${CONFIG_PATH}.${suffix}`, "remote-path", false);
@@ -297,7 +320,7 @@ async function delay(ms: number): Promise<void> {
 
 async function sshExecBuffer(remote: ActiveRemote, command: string, options: SshExecOptions): Promise<Buffer> {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
-	const retries = options.retries ?? 1;
+	const retries = options.retries ?? DEFAULT_SSH_RETRIES;
 	let lastError: FriendlySshError | undefined;
 
 	for (let attempt = 0; attempt <= retries; attempt++) {
@@ -315,16 +338,16 @@ async function sshExecBuffer(remote: ActiveRemote, command: string, options: Ssh
 				remote.consecutiveFailures = 0;
 				remote.lastFailure = undefined;
 			}
-			if (!lastError.retryable || attempt >= retries || remote.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) break;
+			if (!lastError.retryable || attempt >= retries) break;
 			await delay(500 * (attempt + 1));
 		}
 	}
 
 	if (remote.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES && lastError?.retryable) {
 		throw new FriendlySshError(
-			`SSH remote appears unavailable after ${remote.consecutiveFailures} consecutive failures. Last error: ${lastError.message}`,
+			`SSH remote still appears unavailable after ${remote.consecutiveFailures} consecutive failures, but future operations will try again. Last error: ${lastError.message}`,
 			lastError.kind,
-			false,
+			true,
 		);
 	}
 	throw lastError ?? new FriendlySshError(`SSH failed while trying to ${options.purpose}.`, "unknown", false);
@@ -383,8 +406,8 @@ async function probeRemote(remote: ActiveRemote): Promise<void> {
 
 function createRemoteReadOps(remote: ActiveRemote): ReadOperations {
 	return {
-		readFile: (filePath) => sshExecBuffer(remote, `cat -- ${shellQuote(filePath)}`, { purpose: `read ${filePath}`, retries: 1 }),
-		access: (filePath) => sshExecBuffer(remote, `test -r -- ${shellQuote(filePath)}`, { purpose: `check read access for ${filePath}`, retries: 1 }).then(() => {}),
+		readFile: (filePath) => sshExecBuffer(remote, `cat -- ${shellQuote(filePath)}`, { purpose: `read ${filePath}` }),
+		access: (filePath) => sshExecBuffer(remote, `test -r -- ${shellQuote(filePath)}`, { purpose: `check read access for ${filePath}` }).then(() => {}),
 		detectImageMimeType: async (filePath) => {
 			try {
 				const result = await sshExecBuffer(remote, `file --mime-type -b -- ${shellQuote(filePath)}`, { purpose: `detect image type for ${filePath}`, retries: 0 });
@@ -399,9 +422,9 @@ function createRemoteReadOps(remote: ActiveRemote): ReadOperations {
 
 function createRemoteWriteOps(remote: ActiveRemote): WriteOperations {
 	return {
-		mkdir: (dir) => sshExecBuffer(remote, `mkdir -p -- ${shellQuote(dir)}`, { purpose: `create directory ${dir}`, retries: 1 }).then(() => {}),
+		mkdir: (dir) => sshExecBuffer(remote, `mkdir -p -- ${shellQuote(dir)}`, { purpose: `create directory ${dir}` }).then(() => {}),
 		writeFile: async (filePath, content) => {
-			await sshExecBuffer(remote, `cat > ${shellQuote(filePath)}`, { input: content, purpose: `write ${filePath}`, retries: 1 });
+			await sshExecBuffer(remote, `cat > ${shellQuote(filePath)}`, { input: content, purpose: `write ${filePath}` });
 		},
 	};
 }
@@ -423,16 +446,10 @@ function createRemoteBashOps(remote: ActiveRemote, localCwd?: string): BashOpera
 			const purpose = `run bash in ${effectiveCwd}`;
 			let lastError: FriendlySshError | undefined;
 
-			for (let attempt = 0; attempt <= 1; attempt++) {
-				if (remote.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-					throw new FriendlySshError(
-						`SSH remote appears unavailable after ${remote.consecutiveFailures} consecutive failures. Last error: ${remote.lastFailure ?? "unknown SSH failure"}`,
-						"connection",
-						false,
-					);
-				}
+			for (let attempt = 0; attempt <= BASH_SSH_RETRIES; attempt++) {
+				if (remote.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) await delay(1_000);
 
-				const result = await runRemoteBashOnce(remote, command, effectiveCwd, { onData, signal, timeout, purpose, suppressStderr: attempt === 0 });
+				const result = await runRemoteBashOnce(remote, command, effectiveCwd, { onData, signal, timeout, purpose, suppressStderr: attempt < BASH_SSH_RETRIES });
 				if (result.kind === "success") {
 					remote.consecutiveFailures = 0;
 					remote.lastFailure = undefined;
@@ -448,13 +465,14 @@ function createRemoteBashOps(remote: ActiveRemote, localCwd?: string): BashOpera
 					remote.consecutiveFailures = 0;
 					remote.lastFailure = undefined;
 				}
-				const canRetry = lastError.retryable && !result.sawStdout && attempt === 0 && !signal?.aborted && remote.consecutiveFailures < MAX_CONSECUTIVE_FAILURES;
+				const canRetry = lastError.retryable && !result.sawStdout && attempt < BASH_SSH_RETRIES && !signal?.aborted;
 				if (!canRetry) {
 					if (result.stderr.length > 0) onData(result.stderr);
-					onData(Buffer.from(`\n${lastError.message}\n`));
+					const partialOutputNote = lastError.retryable && result.sawStdout ? "\nPartial output was already streamed, so this bash command was not retried automatically. Run the command again after the connection recovers.\n" : "";
+					onData(Buffer.from(`\n${lastError.message}${partialOutputNote}\n`));
 					return { exitCode: 255 };
 				}
-				await delay(500);
+				await delay(500 * (attempt + 1));
 			}
 
 			throw lastError ?? new FriendlySshError(`SSH failed while trying to ${purpose}.`, "unknown", false);

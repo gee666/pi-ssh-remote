@@ -110,6 +110,8 @@ The extension classifies common SSH failures into actionable messages:
 - missing remote project path
 - missing required remote commands
 
-Transient SSH operations are retried once. After repeated infrastructure failures, tools stop retrying and report that the remote appears unavailable instead of spamming raw SSH errors.
+Transient SSH operations are retried automatically. The extension also enables SSH keepalives (`ServerAliveInterval`, `ServerAliveCountMax`) and multiple connection attempts by default. If the remote is unavailable for several consecutive operations, future operations still try again so a recovered SSH connection can be used without restarting pi.
+
+For `bash` commands, the extension retries interrupted SSH connections only when no stdout has been streamed yet. If partial output was already shown, it does not automatically rerun the command because arbitrary shell commands may have side effects; run the command again after the connection recovers.
 
 Remote hosts need `bash`, `cat`, `mkdir`, and `test` available.
