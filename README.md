@@ -1,8 +1,17 @@
 # pi ssh remote
 
-`oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a selected SSH project instead of the local filesystem.
+`oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a remote SSH project instead of the local filesystem. The agent works as if it were running natively on the remote server.
 
-The extension is intentionally inert unless pi is started with `--ssh-remote`.
+The extension is intentionally inert unless pi is started with `--ssh-remote` (or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is set).
+
+## How it works
+
+- One **persistent SSH connection** per session (pure-JS [`ssh2`](https://www.npmjs.com/package/ssh2)), with keepalives and automatic reconnection with backoff. No per-command handshakes.
+- **File operations use SFTP** — binary-safe, no shell quoting, real `ENOENT`/`EACCES` errors. Writes are atomic (temp file + rename, preserving file mode), so a dropped connection can never leave a truncated file.
+- **Bash commands run over exec channels** with live output streaming, real remote exit codes, timeout and Ctrl-C/abort support.
+- **Nothing is installed on the remote host.** A standard sshd with the SFTP subsystem (enabled by default everywhere) and `bash` is all that is required. No agents, no helpers, no node.
+- **No local external binaries either** — no `ssh` or `sshpass` needed. Works identically from Linux, macOS, WSL, and native Windows.
+- **Host key pinning (trust-on-first-use)**: fingerprints are stored in `~/.pi/agent/ssh-remote-known-hosts.json`; a changed host key fails closed with instructions.
 
 ## Installation
 
@@ -11,8 +20,6 @@ pi install npm:oira666_pi-ssh-remote
 ```
 
 ## Usage
-
-Start pi in SSH remote mode:
 
 ```bash
 pi --ssh-remote
@@ -24,7 +31,7 @@ Select a configured project explicitly:
 pi --ssh-remote --ssh-remote-project "My project"
 ```
 
-`--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. In non-UI modes that are not inline/print mode, either configure exactly one project, pass `--ssh-remote-project`, or set `PI_CODING_AGENT_SSH_REMOTE_PROJECT`.
+`--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. In non-UI modes, either configure exactly one project, pass `--ssh-remote-project`, or set `PI_CODING_AGENT_SSH_REMOTE_PROJECT`.
 
 For subprocesses and subagents, the extension exports the selected project as:
 
@@ -32,9 +39,9 @@ For subprocesses and subagents, the extension exports the selected project as:
 PI_CODING_AGENT_SSH_REMOTE_PROJECT='server-name::/exact/remote/project/path'
 ```
 
-This variable also selects and enables a project when starting pi yourself. The canonical format is `server-name::project-path`, where `server-name` is the top-level key in `ssh-remote-config.json` and `project-path` is the exact configured project path. JSON is also accepted for scripting, for example `{"serverName":"server-name","projectPath":"/exact/path"}`. For backwards compatibility, simple selectors such as project title, server name, path, label, or 1-based index are accepted too.
+This variable also selects and enables a project when starting pi yourself. The canonical format is `server-name::project-path`. JSON is also accepted for scripting, for example `{"serverName":"server-name","projectPath":"/exact/path"}`. Simple selectors (title, server name, path, label, 1-based index) are accepted too.
 
-If pi is launched in inline/print mode (`-p` / `--print`), the extension ignores `--ssh-remote` by itself so inherited command-line arguments do not trigger an interactive picker or fail in non-interactive children. In print mode, remote mode is enabled only when `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is set.
+In non-interactive modes (including `-p` / `--print`), the project must be unambiguous: a single configured project, `--ssh-remote-project`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT`. If it is ambiguous, the extension fails closed with a clear error instead of silently working on the local filesystem.
 
 ## Configuration
 
@@ -42,76 +49,77 @@ Create `~/.pi/agent/ssh-remote-config.json`:
 
 ```json
 {
-  "artlin6-dance": {
-    "hostName": "<your host>",
-    "user": "<your user>",
-    "port": <ssh port>,
-    "identityFile": "<path to the ssh key file>",
-    "identitiesOnly": true,
+  "my-server": {
+    "hostName": "example.com",
+    "user": "deploy",
+    "port": 22,
+    "identityFile": "~/.ssh/id_ed25519",
     "projects": [
-      {
-        "title": "Your project title",
-        "path": "/remote/project/path"
-      }
+      { "title": "My project", "path": "/var/www/app" }
     ]
   }
 }
 ```
 
-Each top-level key is a server name. Server fields can use SSH config aliases or explicit settings:
+Each top-level key is a server name. Fields (OpenSSH-style aliases accepted):
 
-- `host` / `Host` / `hostName` / `HostName`
-- `user` / `User`
-- `port` / `Port`
-- `identityFile` / `IdentityFile`
-- `password` / `Password` (requires local `sshpass`; prefer `passwordEnv`)
-- `passwordEnv` / `PasswordEnv` (name of an environment variable containing the password; requires local `sshpass`)
-- `identitiesOnly` / `IdentitiesOnly`
-- `sshOptions` object for additional `-o key=value` options
+- `host` / `hostName` — defaults to the server name itself
+- `user`, `port`
+- `identityFile` — path to a private key (`~` is expanded)
+- `passphrase` / `passphraseEnv` — for encrypted private keys
+- `password` / `passwordEnv` — password authentication, built in, no `sshpass` needed; prefer `passwordEnv` to keep secrets out of the file
 - `projects`: array of `{ "title": string, "path": string }`
 
-If `host` is omitted, the server name is used as the SSH target, which works well with entries in `~/.ssh/config`.
+Project paths may be **absolute** (`/var/www/app`) or **relative to the remote home directory** (`www/app`). Absolute paths are recommended: they let pi start even while the server is temporarily unreachable.
 
-Password authentication is supported when `sshpass` is installed locally. To avoid storing a password in the config file, use `passwordEnv`:
+If neither `identityFile` nor a password is configured, the extension uses your SSH agent (`SSH_AUTH_SOCK`; on Windows, the OpenSSH agent named pipe).
+
+Password example without storing the secret:
 
 ```json
 {
   "example": {
     "hostName": "example.com",
     "user": "deploy",
-    "passwordEnv": "PI_CODING_AGENT_SSH_REPOTE_PASSWORD",
+    "passwordEnv": "MY_SSH_PASSWORD",
     "projects": [{ "title": "App", "path": "/var/www/app" }]
   }
 }
 ```
 
-Then start pi with `PI_CODING_AGENT_SSH_REPOTE_PASSWORD='your password' pi --ssh-remote`. Host-key verification still applies; connect once manually with `ssh example.com` if the host is not in `known_hosts` yet.
+```bash
+MY_SSH_PASSWORD='secret' pi --ssh-remote
+```
 
 ## Behavior
 
-When `--ssh-remote` is not set and `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is not set, the extension only registers its flags and does not override any tools.
+When enabled, the extension selects a project (prompting in UI mode), connects once to verify access and resolve the project directory, registers remote-backed `read`, `write`, `edit`, and `bash` tools, routes user `!` shell commands over SSH, and rewrites the system prompt so the agent sees the remote project directory as its working directory.
 
-When enabled, pi prompts for a configured project in UI mode, checks the local SSH client and configured key/password prerequisites, probes the remote connection and project directory, exports `PI_CODING_AGENT_SSH_REMOTE_PROJECT` for child processes, registers remote-backed replacements for `read`, `write`, `edit`, and `bash`, routes user `!` shell commands over SSH, and rewrites the system prompt working directory to the remote project path.
+Connection lifecycle:
 
-The extension fails closed: if config, authentication, host-key verification, network access, or the remote project path is invalid, pi displays a readable red error and does not let the agent continue as if it were connected.
+- The connection stays open for the whole session and sends keepalives.
+- If it drops, the next operation transparently reconnects (with backoff) and retries the operation once. File operations are safe to retry; **bash commands are never silently rerun** — if the connection drops mid-command, the tool reports exactly that, including a warning that the command may or may not have completed.
+- If the server is unreachable at startup but the project path is absolute, pi stays open and reconnects when the server is back.
 
-## Error handling
+If setup fails, the extension registers replacement tools that **refuse every operation** with the setup error — the agent can never silently fall back to the local filesystem. Fail-closed setup errors include:
 
-The extension classifies common SSH failures into actionable messages:
+- invalid or missing config / project selector
+- unreadable or unparsable private key (with a passphrase hint when relevant)
+- unset `passwordEnv` / `passphraseEnv` variable
+- authentication failure
+- changed host key (pinned fingerprint mismatch)
+- DNS failure / unknown host
+- missing or non-directory remote project path
 
-- missing local `ssh` command
-- missing local `sshpass` command when password auth is configured
-- unset password environment variable
-- unreadable `IdentityFile`
-- authentication/public-key/password failure
-- host-key verification failure
-- DNS/host typo
-- connection refused or timeout
-- missing remote project path
-- missing required remote commands
+## Remote requirements
 
-Transient SSH operations are retried automatically. The extension also enables SSH keepalives (`ServerAliveInterval`, `ServerAliveCountMax`) and multiple connection attempts by default. If the remote is unavailable for several consecutive operations, future operations still try again so a recovered SSH connection can be used without restarting pi.
+A standard SSH server with the SFTP subsystem enabled, plus `bash` for shell commands. Nothing is installed or written outside your project directory.
 
-For `bash` commands, the extension retries interrupted SSH connections only when no stdout has been streamed yet. If partial output was already shown, it does not automatically rerun the command because arbitrary shell commands may have side effects; run the command again after the connection recovers.
+## Development
 
-Remote hosts need `bash`, `cat`, `mkdir`, and `test` available.
+```bash
+npm run typecheck   # strict TS, no emit
+npm test            # integration tests against an in-process ssh2 server
+```
+
+The test suite (`test/test-integration.ts`) spins up a local SSH server (auth + SFTP + exec) and exercises connect, relative path resolution, file round-trips with awkward filenames, binary safety, exit codes, timeouts, aborts, parallel operations, automatic reconnection, and host-key pinning — no network or credentials required.
