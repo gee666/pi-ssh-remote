@@ -25,6 +25,7 @@ import {
 	type RemoteProject,
 } from "./config.ts";
 import { RemoteConnection } from "./connection.ts";
+import { RemoteFsRouter } from "./remote-fs.ts";
 import { FriendlySshError, isFriendly } from "./errors.ts";
 import { createRemoteBashOps, createRemoteEditOps, createRemoteReadOps, createRemoteWriteOps } from "./operations.ts";
 
@@ -117,6 +118,11 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject(project);
 
 			const remote = new RemoteConnection(project);
+			const remoteFs = new RemoteFsRouter(remote);
+			remoteFs.onFallback = (reason) => {
+				if (ctx.hasUI) ctx.ui.notify(`SSH remote: ${reason}`, "warning");
+				else console.error(reason);
+			};
 			let needsPathValidation = false;
 			remote.onStateChange = (state) => {
 				if (state === "connected") {
@@ -126,7 +132,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 					// an invalid path then fails all operations closed.
 					if (needsPathValidation) {
 						needsPathValidation = false;
-						remote.resolveProjectCwd().catch((error) => {
+						remoteFs.resolveProjectCwd().catch((error: unknown) => {
 							if (isFriendly(error) && error.kind === "remote-path") {
 								remote.pathProblem = error;
 								ctx.ui.setStatus("ssh-remote", `SSH path error: ${project.serverName}`);
@@ -146,7 +152,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			// Connect once at startup to verify access and resolve the project
 			// path (it may be relative to the remote home directory).
 			try {
-				await remote.resolveProjectCwd();
+				await remoteFs.resolveProjectCwd();
 			} catch (error) {
 				const friendly = isFriendly(error) ? error : new FriendlySshError(error instanceof Error ? error.message : String(error), "unknown", false);
 				// Setup problems (bad auth, bad key, missing path, host-key
@@ -169,9 +175,9 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			}
 
 			connection = remote;
-			pi.registerTool(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remote) }));
-			pi.registerTool(createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remote) }));
-			pi.registerTool(createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remote) }));
+			pi.registerTool(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }));
+			pi.registerTool(createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remoteFs) }));
+			pi.registerTool(createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remoteFs) }));
 			pi.registerTool(createBashTool(remote.remoteCwd, { operations: createRemoteBashOps(remote, localCwd) }));
 
 			ctx.ui.setTitle(`SSH ${project.project.title}`);

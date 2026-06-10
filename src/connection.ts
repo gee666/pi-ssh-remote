@@ -233,13 +233,13 @@ export class RemoteConnection {
 		}
 	}
 
-	private async getSftp(): Promise<SFTPWrapper> {
+	async getSftp(): Promise<SFTPWrapper> {
 		const client = await this.ensureConnected();
 		if (this.sftp && this.client === client) return this.sftp;
 		if (this.sftpOpening) return this.sftpOpening;
 		this.sftpOpening = (async () => {
 			const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
-				client.sftp((error, sftp) => (error ? reject(classifyConnectionError(error, this.target, CONFIG_PATH)) : resolve(sftp)));
+				client.sftp((error, sftp) => (error ? reject(this.classifySftpEstablishment(error, client)) : resolve(sftp)));
 			});
 			this.sftp = sftp;
 			const forget = () => {
@@ -256,6 +256,27 @@ export class RemoteConnection {
 		} finally {
 			this.sftpOpening = null;
 		}
+	}
+
+	/**
+	 * Distinguish "the server refuses the SFTP subsystem" (jailed shells on
+	 * shared hosting, e.g. exit code 254 while establishing the SFTP session)
+	 * from genuine transport problems. The former triggers the shell-exec
+	 * file-operations fallback instead of failing.
+	 */
+	private classifySftpEstablishment(error: unknown, client: ClientType): FriendlySshError {
+		const message = error instanceof Error ? error.message : String(error);
+		// If the channel itself opened but the subsystem failed (exit code /
+		// refusal), the transport is alive and exec channels can still be used.
+		const transportAlive = this.client === client;
+		if (transportAlive && /establishing SFTP session|subsystem|refused|exit code|exit signal/i.test(message)) {
+			return new FriendlySshError(
+				`The server ${this.target} did not allow an SFTP session (${message}). Falling back to shell-based file operations over the SSH connection.`,
+				"sftp-unavailable",
+				false,
+			);
+		}
+		return classifyConnectionError(error, this.target, CONFIG_PATH);
 	}
 
 	/**
@@ -309,45 +330,6 @@ export class RemoteConnection {
 				throw friendly;
 			}
 		}
-	}
-
-	/**
-	 * Connect and resolve the configured project path to an absolute remote
-	 * directory (relative paths resolve against the remote home directory).
-	 * Throws a friendly error if the path is missing or not a directory.
-	 */
-	async resolveProjectCwd(): Promise<string> {
-		this.pathProblem = null;
-		const configured = this.projectRef.project.path;
-		return await this.withSftp("resolve project path", configured, async (sftp) => {
-			const resolved = await new Promise<string>((resolve, reject) => {
-				sftp.realpath(configured, (error, resolvedPath) => (error ? reject(error) : resolve(resolvedPath)));
-			}).catch(() => {
-				throw new FriendlySshError(
-					`The configured remote project path '${configured}' does not exist on ${this.target}. Update the project path in ${CONFIG_PATH}.`,
-					"remote-path",
-					false,
-				);
-			});
-			const stats = await new Promise<{ isDirectory: () => boolean }>((resolve, reject) => {
-				sftp.stat(resolved, (error, stats) => (error ? reject(error) : resolve(stats)));
-			}).catch(() => {
-				throw new FriendlySshError(
-					`The configured remote project path '${configured}' does not exist on ${this.target}. Update the project path in ${CONFIG_PATH}.`,
-					"remote-path",
-					false,
-				);
-			});
-			if (!stats.isDirectory()) {
-				throw new FriendlySshError(
-					`The configured remote project path '${resolved}' on ${this.target} is not a directory. Update the project path in ${CONFIG_PATH}.`,
-					"remote-path",
-					false,
-				);
-			}
-			this.remoteCwd = resolved;
-			return resolved;
-		});
 	}
 
 	dispose(): void {

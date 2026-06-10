@@ -8,6 +8,7 @@ The extension is intentionally inert unless pi is started with `--ssh-remote` (o
 
 - One **persistent SSH connection** per session (pure-JS [`ssh2`](https://www.npmjs.com/package/ssh2)), with keepalives and automatic reconnection with backoff. No per-command handshakes.
 - **File operations use SFTP** — binary-safe, no shell quoting, real `ENOENT`/`EACCES` errors. Writes are atomic (temp file + rename, preserving file mode), so a dropped connection can never leave a truncated file.
+- **Automatic shell fallback when SFTP is blocked**: some jailed/shared-hosting servers refuse the SFTP subsystem (for example “exit code 254 while establishing SFTP session”). The extension detects this and transparently switches file operations to plain exec channels (`cat`, `mv`, `mkdir`) — still binary-safe, still atomic writes, no behavior change for the agent.
 - **Bash commands run over exec channels** with live output streaming, real remote exit codes, timeout and Ctrl-C/abort support.
 - **Nothing is installed on the remote host.** A standard sshd with the SFTP subsystem (enabled by default everywhere) and `bash` is all that is required. No agents, no helpers, no node.
 - **No local external binaries either** — no `ssh` or `sshpass` needed. Works identically from Linux, macOS, WSL, and native Windows.
@@ -113,7 +114,7 @@ If setup fails, the extension registers replacement tools that **refuse every op
 
 ## Remote requirements
 
-A standard SSH server with the SFTP subsystem enabled, plus `bash` for shell commands. Nothing is installed or written outside your project directory.
+A standard SSH server, plus `bash` for shell commands. The SFTP subsystem is used when available; when it is not (jailed shells, restricted shared hosting), file operations automatically fall back to POSIX shell commands over exec channels. Nothing is installed or written outside your project directory.
 
 ## Development
 

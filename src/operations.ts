@@ -1,10 +1,10 @@
 /**
- * Remote-backed tool operations: read/write/edit over SFTP, bash over an
- * exec channel. All operations share one persistent RemoteConnection.
+ * Remote-backed tool operations: read/write/edit over the RemoteFs router
+ * (SFTP with automatic shell-exec fallback), bash over an exec channel.
+ * All operations share one persistent RemoteConnection.
  */
 
 import path from "node:path";
-import type { SFTPWrapper } from "ssh2";
 import type {
 	BashOperations,
 	EditOperations,
@@ -12,6 +12,7 @@ import type {
 	WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import type { RemoteConnection } from "./connection.ts";
+import type { RemoteFs } from "./remote-fs.ts";
 import { FriendlySshError, classifyConnectionError, isFriendly } from "./errors.ts";
 import { CONFIG_PATH } from "./config.ts";
 
@@ -24,109 +25,6 @@ function toPosix(filePath: string): string {
 	return /^[A-Za-z]:\//.test(slashes) ? slashes.slice(2) : slashes;
 }
 
-function sftpReadFile(sftp: SFTPWrapper, remotePath: string): Promise<Buffer> {
-	return new Promise((resolve, reject) => {
-		sftp.readFile(remotePath, (error, data) => (error ? reject(error) : resolve(data)));
-	});
-}
-
-function sftpWriteFile(sftp: SFTPWrapper, remotePath: string, content: Buffer): Promise<void> {
-	return new Promise((resolve, reject) => {
-		sftp.writeFile(remotePath, content, (error) => (error ? reject(error) : resolve()));
-	});
-}
-
-function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<{ isDirectory: () => boolean }> {
-	return new Promise((resolve, reject) => {
-		sftp.stat(remotePath, (error, stats) => (error ? reject(error) : resolve(stats)));
-	});
-}
-
-function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
-	return new Promise((resolve, reject) => {
-		sftp.mkdir(remotePath, (error) => (error ? reject(error) : resolve()));
-	});
-}
-
-function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
-	return new Promise((resolve, reject) => {
-		sftp.rename(from, to, (error) => (error ? reject(error) : resolve()));
-	});
-}
-
-function sftpPosixRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
-	return new Promise((resolve, reject) => {
-		sftp.ext_openssh_rename(from, to, (error) => (error ? reject(error) : resolve()));
-	});
-}
-
-function sftpUnlink(sftp: SFTPWrapper, remotePath: string): Promise<void> {
-	return new Promise((resolve, reject) => {
-		sftp.unlink(remotePath, (error) => (error ? reject(error) : resolve()));
-	});
-}
-
-function sftpSetMode(sftp: SFTPWrapper, remotePath: string, mode: number): Promise<void> {
-	return new Promise((resolve, reject) => {
-		sftp.setstat(remotePath, { mode }, (error) => (error ? reject(error) : resolve()));
-	});
-}
-
-/**
- * Atomic-ish write: upload to a temp file next to the target, preserve the
- * target's mode, then rename over it. A dropped connection mid-upload can
- * never leave the real file truncated. Falls back to a direct write only if
- * the server cannot rename at all.
- */
-async function atomicWrite(sftp: SFTPWrapper, remotePath: string, content: Buffer): Promise<void> {
-	const tempPath = `${path.posix.dirname(remotePath)}/.${path.posix.basename(remotePath)}.pi-tmp-${Math.random().toString(36).slice(2, 10)}`;
-	const existing = await sftpStat(sftp, remotePath).catch(() => null);
-	try {
-		await sftpWriteFile(sftp, tempPath, content);
-		if (existing && "mode" in existing && typeof (existing as { mode?: number }).mode === "number") {
-			await sftpSetMode(sftp, tempPath, (existing as { mode: number }).mode & 0o7777).catch(() => {});
-		}
-		try {
-			await sftpPosixRename(sftp, tempPath, remotePath);
-		} catch {
-			try {
-				await sftpRename(sftp, tempPath, remotePath);
-			} catch {
-				// SFTP v3 RENAME refuses to overwrite. Unlink then rename; the
-				// window without the file is tiny and the content is safe either way.
-				if (existing) await sftpUnlink(sftp, remotePath).catch(() => {});
-				await sftpRename(sftp, tempPath, remotePath);
-			}
-		}
-	} catch (error) {
-		await sftpUnlink(sftp, tempPath).catch(() => {});
-		throw error;
-	}
-}
-
-async function mkdirRecursive(sftp: SFTPWrapper, dir: string): Promise<void> {
-	const normalized = path.posix.normalize(toPosix(dir));
-	const segments = normalized.split("/").filter(Boolean);
-	let current = normalized.startsWith("/") ? "/" : "";
-	for (const segment of segments) {
-		current = current === "" ? segment : path.posix.join(current, segment);
-		try {
-			const stats = await sftpStat(sftp, current);
-			if (stats.isDirectory()) continue;
-			throw new Error(`ENOTDIR: '${current}' exists and is not a directory`);
-		} catch (error) {
-			if (error instanceof Error && error.message.startsWith("ENOTDIR")) throw error;
-			// Missing: try to create it. Races with concurrent creation are fine.
-			try {
-				await sftpMkdir(sftp, current);
-			} catch (mkdirError) {
-				const stats = await sftpStat(sftp, current).catch(() => null);
-				if (!stats?.isDirectory()) throw mkdirError;
-			}
-		}
-	}
-}
-
 const IMAGE_SIGNATURES: Array<{ mime: string; matches: (head: Buffer) => boolean }> = [
 	{ mime: "image/jpeg", matches: (head) => head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff },
 	{ mime: "image/png", matches: (head) => head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
@@ -134,23 +32,15 @@ const IMAGE_SIGNATURES: Array<{ mime: string; matches: (head: Buffer) => boolean
 	{ mime: "image/webp", matches: (head) => head.length >= 12 && head.subarray(0, 4).toString("latin1") === "RIFF" && head.subarray(8, 12).toString("latin1") === "WEBP" },
 ];
 
-export function createRemoteReadOps(remote: RemoteConnection): ReadOperations {
+export function createRemoteReadOps(fs: RemoteFs): ReadOperations {
 	return {
-		readFile: (filePath) => {
-			const remotePath = toPosix(filePath);
-			return remote.withSftp("open", remotePath, (sftp) => sftpReadFile(sftp, remotePath));
-		},
+		readFile: (filePath) => fs.readFile(toPosix(filePath)),
 		access: async (filePath) => {
-			const remotePath = toPosix(filePath);
-			await remote.withSftp("access", remotePath, (sftp) => sftpStat(sftp, remotePath));
+			await fs.stat(toPosix(filePath));
 		},
 		detectImageMimeType: async (filePath) => {
-			const remotePath = toPosix(filePath);
 			try {
-				const head = await remote.withSftp("read", remotePath, async (sftp) => {
-					const buffer = await sftpReadFile(sftp, remotePath);
-					return buffer.subarray(0, 16);
-				});
+				const head = (await fs.readFile(toPosix(filePath))).subarray(0, 16);
 				return IMAGE_SIGNATURES.find((signature) => signature.matches(head))?.mime ?? null;
 			} catch {
 				return null;
@@ -159,22 +49,16 @@ export function createRemoteReadOps(remote: RemoteConnection): ReadOperations {
 	};
 }
 
-export function createRemoteWriteOps(remote: RemoteConnection): WriteOperations {
+export function createRemoteWriteOps(fs: RemoteFs): WriteOperations {
 	return {
-		mkdir: async (dir) => {
-			const remoteDir = toPosix(dir);
-			await remote.withSftp("mkdir", remoteDir, (sftp) => mkdirRecursive(sftp, remoteDir));
-		},
-		writeFile: async (filePath, content) => {
-			const remotePath = toPosix(filePath);
-			await remote.withSftp("write", remotePath, (sftp) => atomicWrite(sftp, remotePath, Buffer.from(content, "utf8")));
-		},
+		mkdir: (dir) => fs.mkdirs(toPosix(dir)),
+		writeFile: (filePath, content) => fs.writeFile(toPosix(filePath), Buffer.from(content, "utf8")),
 	};
 }
 
-export function createRemoteEditOps(remote: RemoteConnection): EditOperations {
-	const readOps = createRemoteReadOps(remote);
-	const writeOps = createRemoteWriteOps(remote);
+export function createRemoteEditOps(fs: RemoteFs): EditOperations {
+	const readOps = createRemoteReadOps(fs);
+	const writeOps = createRemoteWriteOps(fs);
 	return {
 		readFile: readOps.readFile,
 		access: readOps.access,

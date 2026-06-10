@@ -8,7 +8,7 @@ import ssh2 from "ssh2";
 const { Server, utils } = ssh2;
 const { STATUS_CODE } = utils.sftp;
 
-export function startServer(options: { port: number; hostKeyPath: string; sandbox: string }): Promise<{ close: () => void; dropConnections: () => void }> {
+export function startServer(options: { port: number; hostKeyPath: string; sandbox: string; disableSftp?: boolean }): Promise<{ close: () => void; dropConnections: () => void }> {
 	const clients = new Set<import("ssh2").Connection>();
 	const server = new Server({ hostKeys: [fs.readFileSync(options.hostKeyPath)] }, (client) => {
 		client.on("error", () => {});
@@ -22,7 +22,10 @@ export function startServer(options: { port: number; hostKeyPath: string; sandbo
 				const session = acceptSession();
 				session.on("exec", (acceptExec, _reject, info) => {
 					const stream = acceptExec();
-					const child = spawn("bash", ["-c", info.command]);
+					// Real sshd starts exec commands in the user's home directory.
+					const child = spawn("bash", ["-c", info.command], { cwd: options.sandbox });
+					stream.pipe(child.stdin);
+					child.stdin.on("error", () => {});
 					child.stdout.pipe(stream, { end: false });
 					child.stderr.pipe(stream.stderr, { end: false });
 					child.on("close", (code) => {
@@ -31,7 +34,12 @@ export function startServer(options: { port: number; hostKeyPath: string; sandbo
 					});
 					stream.on("close", () => child.kill());
 				});
-				session.on("sftp", (acceptSftp) => {
+				session.on("sftp", (acceptSftp, rejectSftp) => {
+					if (options.disableSftp) {
+						// Emulate jailed shared hosting where the sftp subsystem fails.
+						rejectSftp();
+						return;
+					}
 					const sftp = acceptSftp();
 					const handles = new Map<number, number>();
 					let nextHandle = 1;
