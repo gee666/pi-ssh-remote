@@ -26,6 +26,10 @@ export interface RemoteFs {
 	mkdirs(remoteDir: string): Promise<void>;
 	/** Resolve a (possibly relative) directory path to an absolute one. */
 	realpathDir(remotePath: string): Promise<string>;
+	/** List entry names in a directory (relative paths resolve against home). */
+	listDir(remotePath: string): Promise<string[]>;
+	/** Cheap session health check; throws if the backend cannot run at all. */
+	probe(): Promise<void>;
 }
 
 function shellQuote(value: string): string {
@@ -152,6 +156,15 @@ function createSftpFs(remote: RemoteConnection): RemoteFs {
 					sftp.realpath(remotePath, (error, resolved) => (error ? reject(error) : resolve(resolved)));
 				});
 			}),
+		listDir: (remotePath) =>
+			remote.withSftp("readdir", remotePath, (sftp) => {
+				return new Promise<string[]>((resolve, reject) => {
+					sftp.readdir(remotePath, (error, entries) => (error ? reject(error) : resolve(entries.map((entry) => entry.filename))));
+				});
+			}),
+		probe: async () => {
+			await remote.withSftp("probe", ".", (sftp) => sftpStat(sftp, "."));
+		},
 	};
 }
 
@@ -263,9 +276,29 @@ function createShellFs(remote: RemoteConnection): RemoteFs {
 			if (result.code !== 0) throw shellError(SHELL_EACCES, "mkdir", remoteDir, result.stderr.toString());
 		},
 		realpathDir: async (remotePath) => {
-			const result = await runScript(remote, `cd -- ${shellQuote(remotePath)} 2>/dev/null || exit ${SHELL_ENOENT}; pwd -P`);
+			// Anchor at $HOME first: some jailed shells do not start exec
+			// commands in the home directory. The markers protect against any
+			// banner/notice output the shell may inject.
+			const script = `cd "$HOME" 2>/dev/null; cd -- ${shellQuote(remotePath)} 2>/dev/null || exit ${SHELL_ENOENT}; printf '<<PI[%s]PI>>' "$(pwd -P)"`;
+			const result = await runScript(remote, script);
 			if (result.code !== 0) throw shellError(result.code, "resolve", remotePath, result.stderr.toString());
-			return result.stdout.toString().trim();
+			const match = result.stdout.toString().match(/<<PI\[([\s\S]*)\]PI>>/);
+			if (!match) throw new Error(`Unexpected output while resolving '${remotePath}' on the remote: ${result.stdout.toString().slice(0, 200)}`);
+			return match[1];
+		},
+		probe: async () => {
+			const result = await runScript(remote, `echo __pi_probe_ok__`);
+			if (result.code !== 0 || !result.stdout.toString().includes("__pi_probe_ok__")) {
+				throw new Error(`Shell session probe failed (exit code ${result.code})${result.stderr.toString().trim() ? `: ${result.stderr.toString().trim()}` : ""}`);
+			}
+		},
+		listDir: async (remotePath) => {
+			const script = `cd "$HOME" 2>/dev/null; cd -- ${shellQuote(remotePath)} 2>/dev/null || exit ${SHELL_ENOENT}; printf '<<PI[';\nls -1A;\nprintf ']PI>>'`;
+			const result = await runScript(remote, script);
+			if (result.code !== 0) throw shellError(result.code, "readdir", remotePath, result.stderr.toString());
+			const match = result.stdout.toString().match(/<<PI\[([\s\S]*)\]PI>>/);
+			if (!match) return [];
+			return match[1].split("\n").map((line) => line.trim()).filter(Boolean);
 		},
 	};
 }
@@ -341,6 +374,12 @@ export class RemoteFsRouter implements RemoteFs {
 	realpathDir(remotePath: string): Promise<string> {
 		return this.run((fs) => fs.realpathDir(remotePath));
 	}
+	listDir(remotePath: string): Promise<string[]> {
+		return this.run((fs) => fs.listDir(remotePath));
+	}
+	probe(): Promise<void> {
+		return this.run((fs) => fs.probe());
+	}
 
 	/**
 	 * Connect, resolve the configured project path (relative paths resolve
@@ -350,23 +389,65 @@ export class RemoteFsRouter implements RemoteFs {
 	async resolveProjectCwd(): Promise<string> {
 		this.remote.pathProblem = null;
 		const configured = this.remote.projectRef.project.path;
-		const pathError = () =>
-			new FriendlySshError(
-				`The configured remote project path '${configured}' does not exist on ${this.remote.target} or is not a directory. Update the project path in ${CONFIG_PATH}.`,
-				"remote-path",
-				false,
-			);
 		let resolved: string;
 		try {
 			resolved = await this.realpathDir(configured);
 			const stats = await this.stat(resolved);
-			if (!stats.isDirectory) throw pathError();
+			if (!stats.isDirectory) throw await this.pathError(configured);
 		} catch (error) {
-			if (isFriendly(error) && error.retryable) throw error;
-			if (isFriendly(error) && error.kind !== "remote-path") throw error;
-			throw pathError();
+			if (isFriendly(error)) throw error;
+			// A confirmed missing path maps to a path error; anything else means
+			// the session/commands themselves failed, which must not be reported
+			// as a wrong project path.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") throw await this.pathError(configured);
+			throw await this.diagnoseFailure(error);
 		}
 		this.remote.remoteCwd = resolved;
 		return resolved;
+	}
+
+	/**
+	 * Distinguish "commands fail because the server refuses all sessions"
+	 * (broken/disabled jailed shell: login succeeds, every session exits
+	 * immediately, typically with code 254) from other unexpected errors.
+	 */
+	private async diagnoseFailure(original: unknown): Promise<FriendlySshError> {
+		const message = original instanceof Error ? original.message : String(original);
+		try {
+			await this.probe();
+		} catch {
+			return new FriendlySshError(
+				`SSH login to ${this.remote.target} succeeds, but the server refuses to start any session: SFTP and shell commands are both rejected immediately. ` +
+					`This is a server-side restriction, not a configuration problem on this machine — shell access is disabled or the jailed shell is broken for this account ` +
+					`(an immediate exit code 254 is typical for cPanel jailshell). Enable shell/SSH access in the hosting control panel or ask the hosting provider to fix it. ` +
+					`(Underlying error: ${message})`,
+				"no-session",
+				false,
+			);
+		}
+		return new FriendlySshError(`Failed to resolve the remote project path: ${message}`, "unknown", false);
+	}
+
+	/**
+	 * Build a remote-path error enriched with what actually exists in the
+	 * directory the configured path was resolved against, so a typo can be
+	 * corrected without a separate shell session.
+	 */
+	private async pathError(configured: string): Promise<FriendlySshError> {
+		const base = configured.startsWith("/") ? path.posix.dirname(configured) : ".";
+		let hint = "";
+		try {
+			const entries = (await this.listDir(base)).filter((name) => name !== "." && name !== "..");
+			const shown = entries.slice(0, 40).join(", ");
+			const more = entries.length > 40 ? `, ... (${entries.length - 40} more)` : "";
+			hint = `\nEntries that do exist in ${base === "." ? "the remote home directory" : `'${base}'`}: ${shown}${more}`;
+		} catch {
+			// Listing is best-effort diagnostics only.
+		}
+		return new FriendlySshError(
+			`The configured remote project path '${configured}' does not exist on ${this.remote.target} or is not a directory. Update the project path in ${CONFIG_PATH}.${hint}`,
+			"remote-path",
+			false,
+		);
 	}
 }

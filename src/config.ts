@@ -125,6 +125,9 @@ export async function loadProjects(): Promise<RemoteProject[]> {
 	} catch {
 		return [];
 	}
+	// Tolerate a UTF-8 BOM: PowerShell and Notepad routinely add one, and
+	// strict JSON.parse rejects it.
+	raw = raw.replace(/^\uFEFF/, "");
 	if (!raw.trim()) return [];
 
 	let config: ConfigFile;

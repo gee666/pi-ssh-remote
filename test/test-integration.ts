@@ -213,8 +213,20 @@ check("shell fallback: no temp files left", !fs.readdirSync(shCwd).some((f) => f
 const shBadPath = new RemoteConnection({ ...projectRef, project: { title: "x", path: "no-such-dir" } });
 const shPathError = await new RemoteFsRouter(shBadPath).resolveProjectCwd().then(() => null, (e) => e);
 check("shell fallback: missing project path error", shPathError?.kind === "remote-path", shPathError?.message?.slice(0, 80));
+check("shell fallback: path error lists real home entries", /Entries that do exist.*project/s.test(shPathError?.message ?? ""), shPathError?.message?.split("\n")[1]?.slice(0, 80));
 shBadPath.dispose();
 shRemote.dispose();
+server.close();
+await new Promise((resolve) => setTimeout(resolve, 200));
+
+// --- broken jailshell: auth works, every session exits 254, SFTP refused ---
+// must be reported as a server-side restriction, NOT as a wrong project path
+server = await startServer({ port: PORT, hostKeyPath: HOSTKEY, sandbox: SANDBOX, disableSftp: true, breakSessions: true });
+const brokenRemote = new RemoteConnection(projectRef);
+const brokenError = await new RemoteFsRouter(brokenRemote).resolveProjectCwd().then(() => null, (e) => e);
+check("broken jailshell -> no-session diagnosis", brokenError?.kind === "no-session", `kind=${brokenError?.kind}`);
+check("broken jailshell: message blames the server", /refuses to start any session|server-side restriction/.test(brokenError?.message ?? ""), brokenError?.message?.slice(0, 90));
+brokenRemote.dispose();
 
 // cleanup pin + server
 try {

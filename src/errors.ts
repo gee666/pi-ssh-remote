@@ -16,6 +16,7 @@ export type SshFailureKind =
 	| "remote-path"
 	| "remote-permission"
 	| "sftp-unavailable"
+	| "no-session"
 	| "cancelled"
 	| "config"
 	| "unknown";
