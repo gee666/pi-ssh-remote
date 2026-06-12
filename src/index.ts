@@ -36,6 +36,10 @@ function redError(message: string): void {
 	console.error(`${RED}${message}${RESET}`);
 }
 
+function dimStatus(ctx: ExtensionContext, text: string): string {
+	return typeof ctx.ui?.theme?.fg === "function" ? ctx.ui.theme.fg("dim", text) : text;
+}
+
 /**
  * Tools that fail closed with the SSH setup error. Registered when remote
  * mode was requested but setup failed, so the agent can never silently fall
@@ -126,7 +130,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			let needsPathValidation = false;
 			remote.onStateChange = (state) => {
 				if (state === "connected") {
-					ctx.ui.setStatus("ssh-remote", `SSH: ${project.serverName}:${remote.remoteCwd}`);
+					ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${project.serverName}:${remote.remoteCwd}`));
 					// If startup happened while the server was unreachable, the
 					// configured path was never verified. Verify on first reconnect;
 					// an invalid path then fails all operations closed.
@@ -135,7 +139,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 						remoteFs.resolveProjectCwd().catch((error: unknown) => {
 							if (isFriendly(error) && error.kind === "remote-path") {
 								remote.pathProblem = error;
-								ctx.ui.setStatus("ssh-remote", `SSH path error: ${project.serverName}`);
+								ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH path error: ${project.serverName}`));
 								if (ctx.hasUI) ctx.ui.notify(error.message, "error");
 							} else {
 								needsPathValidation = true;
@@ -143,9 +147,9 @@ export default function piSshRemote(pi: ExtensionAPI) {
 						});
 					}
 				} else if (state === "reconnecting") {
-					ctx.ui.setStatus("ssh-remote", `SSH reconnecting: ${project.serverName}`);
+					ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH reconnecting: ${project.serverName}`));
 				} else {
-					ctx.ui.setStatus("ssh-remote", `SSH unavailable: ${project.serverName}`);
+					ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH unavailable: ${project.serverName}`));
 				}
 			};
 
@@ -182,7 +186,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 
 			ctx.ui.setTitle(`SSH ${project.project.title}`);
 			if (!startupWarning) {
-				ctx.ui.setStatus("ssh-remote", `SSH: ${project.serverName}:${remote.remoteCwd}`);
+				ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${project.serverName}:${remote.remoteCwd}`));
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote connected: ${project.label}`, "info");
 			}
 		} catch (error) {
@@ -195,7 +199,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			// remote project.
 			registerFailClosedTools(pi, localCwd, message);
 			redError(message);
-			ctx.ui.setStatus("ssh-remote", "SSH setup failed");
+			ctx.ui.setStatus("ssh-remote", dimStatus(ctx, "SSH setup failed"));
 			if (ctx.hasUI) ctx.ui.notify(message, "error");
 		}
 	});
