@@ -94,13 +94,13 @@ async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext): Promise<R
 }
 
 export default function piSshRemote(pi: ExtensionAPI) {
-	pi.registerFlag("ssh-remote", {
+	pi.registerFlag("ssh", {
 		description: "Enable SSH remote mode and select a project from ~/.pi/agent/ssh-remote-config.json",
 		type: "boolean",
 		default: false,
 	});
 	pi.registerFlag("ssh-remote-project", {
-		description: "Project selector for --ssh-remote in non-interactive mode (title, server name, path, or 1-based index)",
+		description: "Project selector for --ssh in non-interactive mode (title, server name, path, or 1-based index)",
 		type: "string",
 	});
 
@@ -111,7 +111,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const inheritedProject = process.env[INHERITED_PROJECT_ENV];
-		if (pi.getFlag("ssh-remote") !== true && !inheritedProject) return;
+		if (pi.getFlag("ssh") !== true && !inheritedProject) return;
 
 		try {
 			fatalStartupError = null;

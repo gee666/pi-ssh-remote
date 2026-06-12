@@ -2,7 +2,7 @@
 
 `oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a remote SSH project instead of the local filesystem. The agent works as if it were running natively on the remote server.
 
-The extension is intentionally inert unless pi is started with `--ssh-remote` (or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is set).
+The extension is intentionally inert unless pi is started with `--ssh` (or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is set).
 
 ## How it works
 
@@ -23,13 +23,13 @@ pi install npm:oira666_pi-ssh-remote
 ## Usage
 
 ```bash
-pi --ssh-remote
+pi --ssh
 ```
 
 Select a configured project explicitly:
 
 ```bash
-pi --ssh-remote --ssh-remote-project "My project"
+pi --ssh --ssh-remote-project "My project"
 ```
 
 `--ssh-remote-project` accepts a project title, server name, project path, or 1-based index. In non-UI modes, either configure exactly one project, pass `--ssh-remote-project`, or set `PI_CODING_AGENT_SSH_REMOTE_PROJECT`.
@@ -89,7 +89,7 @@ Password example without storing the secret:
 ```
 
 ```bash
-MY_SSH_PASSWORD='secret' pi --ssh-remote
+MY_SSH_PASSWORD='secret' pi --ssh
 ```
 
 ## Behavior
