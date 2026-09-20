@@ -1,6 +1,6 @@
 # pi ssh remote
 
-`oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a remote SSH project instead of the local filesystem. The agent works as if it were running natively on the remote server.
+`oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a remote SSH project instead of the local filesystem. The agent works as if it were running natively on the remote server. Available skills are the exception: `read` checks their advertised paths locally first, then falls back to SSH if the local file is absent. This also covers supporting files inside directory skills. Ordinary project reads, writes, edits, and shell commands remain remote.
 
 The extension is intentionally inert unless pi is started with `--ssh` (or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` is set).
 

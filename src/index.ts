@@ -26,6 +26,7 @@ import {
 } from "./config.ts";
 import { RemoteConnection } from "./connection.ts";
 import { RemoteFsRouter } from "./remote-fs.ts";
+import { withLocalSkillReads } from "./skill-read.ts";
 import { FriendlySshError, isFriendly } from "./errors.ts";
 import { createRemoteBashOps, createRemoteEditOps, createRemoteReadOps, createRemoteWriteOps } from "./operations.ts";
 
@@ -45,9 +46,9 @@ function dimStatus(ctx: ExtensionContext, text: string): string {
  * mode was requested but setup failed, so the agent can never silently fall
  * back to operating on the local filesystem.
  */
-function registerFailClosedTools(pi: ExtensionAPI, localCwd: string, message: string): void {
+function registerFailClosedTools(pi: ExtensionAPI, localCwd: string, message: string, getSkillPaths: () => readonly string[]): void {
 	const refuse = () => Promise.reject(new Error(`SSH remote mode is active but unavailable: ${message}`));
-	pi.registerTool(createReadTool(localCwd, { operations: { readFile: refuse, access: refuse } }));
+	pi.registerTool(withLocalSkillReads(createReadTool(localCwd, { operations: { readFile: refuse, access: refuse } }), localCwd, getSkillPaths));
 	pi.registerTool(createWriteTool(localCwd, { operations: { writeFile: refuse, mkdir: refuse } }));
 	pi.registerTool(createEditTool(localCwd, { operations: { readFile: refuse, writeFile: refuse, access: refuse } }));
 	pi.registerTool(createBashTool(localCwd, { operations: failClosedBashOps(message) }));
@@ -108,6 +109,8 @@ export default function piSshRemote(pi: ExtensionAPI) {
 	let fatalStartupError: string | null = null;
 	let startupWarning: string | null = null;
 	const localCwd = process.cwd();
+	let skillPaths: string[] = [];
+	const getSkillPaths = () => skillPaths;
 
 	pi.on("session_start", async (_event, ctx) => {
 		const inheritedProject = process.env[INHERITED_PROJECT_ENV];
@@ -179,7 +182,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			}
 
 			connection = remote;
-			pi.registerTool(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }));
+			pi.registerTool(withLocalSkillReads(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }), localCwd, getSkillPaths));
 			pi.registerTool(createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remoteFs) }));
 			pi.registerTool(createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remoteFs) }));
 			pi.registerTool(createBashTool(remote.remoteCwd, { operations: createRemoteBashOps(remote, localCwd) }));
@@ -197,7 +200,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			// Fail closed: replace the built-in tools with ones that refuse to
 			// run, so the agent cannot mistake the local directory for the
 			// remote project.
-			registerFailClosedTools(pi, localCwd, message);
+			registerFailClosedTools(pi, localCwd, message, getSkillPaths);
 			redError(message);
 			ctx.ui.setStatus("ssh-remote", dimStatus(ctx, "SSH setup failed"));
 			if (ctx.hasUI) ctx.ui.notify(message, "error");
@@ -213,6 +216,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", (event) => {
+		skillPaths = event.systemPromptOptions?.skills?.map((skill) => skill.filePath) ?? [];
 		if (!connection) {
 			if (!fatalStartupError) return;
 			return {
@@ -223,11 +227,8 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			};
 		}
 		const remote = connection;
-		let replaced = event.systemPrompt.replaceAll(`Current working directory: ${localCwd}`, `Current working directory: ${remote.remoteCwd}`);
-		// Replace other mentions of the local cwd, but only when it is specific
-		// enough that a blanket replacement cannot mangle unrelated paths
-		// (think localCwd === "/" or "/tmp").
-		if (localCwd.length > 5) replaced = replaced.replaceAll(localCwd, remote.remoteCwd);
+		// Preserve advertised local skill paths, including project/package skills.
+		const replaced = event.systemPrompt.replaceAll(`Current working directory: ${localCwd}`, `Current working directory: ${remote.remoteCwd}`);
 		const warning = startupWarning
 			? ` The startup connection attempt failed (${startupWarning}), but the connection re-establishes automatically, so tool calls should be retried.`
 			: "";
@@ -235,7 +236,9 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			systemPrompt:
 				`${replaced}\n\nSSH remote mode is active. The current project root is ${remote.remoteCwd} on the remote server ` +
 				`'${remote.projectRef.serverName}' (${remote.target}); the read, write, edit, and bash tools operate there transparently ` +
-				`over a persistent SSH connection. Always use POSIX paths under ${remote.remoteCwd}.${warning} ` +
+				`over a persistent SSH connection. Use POSIX paths under ${remote.remoteCwd} for project files.${warning} ` +
+				`For available skills and their supporting files, use read with their advertised paths unchanged: ` +
+				`read checks locally first and uses the remote path only when the local skill file is absent. ` +
 				`If an SSH operation reports an authentication, host-key, network, timeout, or missing-path error, explain it clearly ` +
 				`to the user instead of repeatedly retrying the same action.`,
 		};
