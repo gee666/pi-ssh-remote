@@ -8,10 +8,13 @@
  * sshd with the SFTP subsystem and a POSIX shell is enough.
  */
 
-import type { BashOperations, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BashOperations, ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
 	createEditTool,
+	createFindTool,
+	createGrepTool,
+	createLsTool,
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
@@ -27,6 +30,7 @@ import {
 import { RemoteConnection } from "./connection.ts";
 import { RemoteFsRouter } from "./remote-fs.ts";
 import { withLocalSkillReads } from "./skill-read.ts";
+import { createRemoteSearchTools } from "./search-tools.ts";
 import { FriendlySshError, isFriendly } from "./errors.ts";
 import { createRemoteBashOps, createRemoteEditOps, createRemoteReadOps, createRemoteWriteOps } from "./operations.ts";
 
@@ -46,12 +50,33 @@ function dimStatus(ctx: ExtensionContext, text: string): string {
  * mode was requested but setup failed, so the agent can never silently fall
  * back to operating on the local filesystem.
  */
-function registerFailClosedTools(pi: ExtensionAPI, localCwd: string, message: string, getSkillPaths: () => readonly string[]): void {
+type Mode = "ssh" | "ssh-local" | "ssh-local-first";
+
+function localTools(cwd: string): ToolDefinition[] {
+	return [createReadTool(cwd), createWriteTool(cwd), createEditTool(cwd), createBashTool(cwd),
+		createGrepTool(cwd), createFindTool(cwd), createLsTool(cwd)];
+}
+
+function namedTool<T extends { name: string; label: string; description: string }>(tool: T, suffix: string, location: string): T {
+	return { ...tool, name: tool.name + suffix, label: tool.label + suffix,
+		description: `${location} ${tool.description}` };
+}
+
+function registerFailClosedTools(pi: ExtensionAPI, localCwd: string, message: string, getSkillPaths: () => readonly string[], mode: Mode): void {
 	const refuse = () => Promise.reject(new Error(`SSH remote mode is active but unavailable: ${message}`));
-	pi.registerTool(withLocalSkillReads(createReadTool(localCwd, { operations: { readFile: refuse, access: refuse } }), localCwd, getSkillPaths));
-	pi.registerTool(createWriteTool(localCwd, { operations: { writeFile: refuse, mkdir: refuse } }));
-	pi.registerTool(createEditTool(localCwd, { operations: { readFile: refuse, writeFile: refuse, access: refuse } }));
-	pi.registerTool(createBashTool(localCwd, { operations: failClosedBashOps(message) }));
+	const suffix = mode === "ssh-local-first" ? "-ssh" : "";
+	const tools: ToolDefinition[] = [
+		withLocalSkillReads(createReadTool(localCwd, { operations: { readFile: refuse, access: refuse } }), localCwd, getSkillPaths),
+		createWriteTool(localCwd, { operations: { writeFile: refuse, mkdir: refuse } }),
+		createEditTool(localCwd, { operations: { readFile: refuse, writeFile: refuse, access: refuse } }),
+		createBashTool(localCwd, { operations: failClosedBashOps(message) }),
+	];
+	for (const tool of tools) pi.registerTool(namedTool(tool, suffix, "SSH unavailable."));
+	if (mode !== "ssh") {
+		for (const tool of [createGrepTool(localCwd), createFindTool(localCwd), createLsTool(localCwd)]) {
+			pi.registerTool({ ...namedTool(tool, suffix, "SSH unavailable."), execute: refuse });
+		}
+	}
 }
 
 function failClosedBashOps(message: string): BashOperations {
@@ -100,11 +125,22 @@ export default function piSshRemote(pi: ExtensionAPI) {
 		type: "boolean",
 		default: false,
 	});
+	pi.registerFlag("ssh-local", {
+		description: "Use SSH tools by default and expose local tools with a -local suffix",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerFlag("ssh-local-first", {
+		description: "Use local tools by default and expose SSH tools with a -ssh suffix",
+		type: "boolean",
+		default: false,
+	});
 	pi.registerFlag("ssh-remote-project", {
-		description: "Project selector for --ssh in non-interactive mode (title, server name, path, or 1-based index)",
+		description: "Project selector for SSH modes in non-interactive mode (title, server name, path, or 1-based index)",
 		type: "string",
 	});
 
+	let mode: Mode = "ssh";
 	let connection: RemoteConnection | null = null;
 	let fatalStartupError: string | null = null;
 	let startupWarning: string | null = null;
@@ -114,9 +150,17 @@ export default function piSshRemote(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const inheritedProject = process.env[INHERITED_PROJECT_ENV];
-		if (pi.getFlag("ssh") !== true && !inheritedProject) return;
+		const flags = (["ssh", "ssh-local", "ssh-local-first"] as const).filter((name) => pi.getFlag(name) === true);
+		if (flags.length === 0 && !inheritedProject) return;
+		mode = flags.includes("ssh-local-first") ? "ssh-local-first" : flags.includes("ssh-local") ? "ssh-local" : "ssh";
+		if (mode !== "ssh") {
+			for (const tool of localTools(localCwd)) {
+				pi.registerTool(namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`));
+			}
+		}
 
 		try {
+			if (flags.length > 1) throw new Error("Choose only one of --ssh, --ssh-local, or --ssh-local-first.");
 			fatalStartupError = null;
 			startupWarning = null;
 			connection?.dispose();
@@ -125,6 +169,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject(project);
 
 			const remote = new RemoteConnection(project);
+			connection = remote;
 			const remoteFs = new RemoteFsRouter(remote);
 			remoteFs.onFallback = (reason) => {
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote: ${reason}`, "warning");
@@ -181,11 +226,16 @@ export default function piSshRemote(pi: ExtensionAPI) {
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote is not reachable yet; pi will keep running and reconnect automatically. ${friendly.message}`, "error");
 			}
 
-			connection = remote;
-			pi.registerTool(withLocalSkillReads(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }), localCwd, getSkillPaths));
-			pi.registerTool(createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remoteFs) }));
-			pi.registerTool(createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remoteFs) }));
-			pi.registerTool(createBashTool(remote.remoteCwd, { operations: createRemoteBashOps(remote, localCwd) }));
+			const remoteTools: ToolDefinition[] = [
+				withLocalSkillReads(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }), localCwd, getSkillPaths),
+				createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remoteFs) }),
+				createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remoteFs) }),
+				createBashTool(remote.remoteCwd, { operations: createRemoteBashOps(remote, localCwd) }),
+				...(mode === "ssh" ? [] : createRemoteSearchTools(remote, localCwd)),
+			];
+			for (const tool of remoteTools) {
+				pi.registerTool(namedTool(tool, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${remote.remoteCwd}.`));
+			}
 
 			ctx.ui.setTitle(`SSH ${project.project.title}`);
 			if (!startupWarning) {
@@ -200,14 +250,27 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			// Fail closed: replace the built-in tools with ones that refuse to
 			// run, so the agent cannot mistake the local directory for the
 			// remote project.
-			registerFailClosedTools(pi, localCwd, message, getSkillPaths);
+			registerFailClosedTools(pi, localCwd, message, getSkillPaths, mode);
 			redError(message);
 			ctx.ui.setStatus("ssh-remote", dimStatus(ctx, "SSH setup failed"));
 			if (ctx.hasUI) ctx.ui.notify(message, "error");
 		}
+		if (mode !== "ssh") {
+			// Overriding an inactive built-in does not activate it. Mixed modes
+			// expose all seven tools on both machines, including search tools.
+			const names = localTools(localCwd).map((tool) => tool.name);
+			const suffix = mode === "ssh-local" ? "-local" : "-ssh";
+			pi.setActiveTools([...new Set([...pi.getActiveTools(), ...names, ...names.map((name) => name + suffix)])]);
+		}
+	});
+
+	pi.on("session_shutdown", () => {
+		connection?.dispose();
+		connection = null;
 	});
 
 	pi.on("user_bash", () => {
+		if (mode === "ssh-local-first") return;
 		if (!connection) {
 			if (!fatalStartupError) return;
 			return { operations: failClosedBashOps(fatalStartupError) };
@@ -222,11 +285,25 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			return {
 				systemPrompt:
 					`${event.systemPrompt}\n\nSSH remote mode was requested, but setup failed before remote tools could be registered. ` +
-					`Do not inspect or modify the local fallback directory as if it were the remote project. ` +
+					(mode === "ssh-local-first"
+						? `Unsuffixed tools and user ! commands still run locally in ${localCwd}; tools ending in -ssh refuse operations. `
+						: `Do not inspect or modify the local fallback directory as if it were the remote project. ` +
+							(mode === "ssh-local" ? `Explicit -local tools remain available in ${localCwd}. ` : "")) +
 					`Explain this SSH setup error to the user and ask them to fix it: ${fatalStartupError}`,
 			};
 		}
 		const remote = connection;
+		if (mode === "ssh-local-first") {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\nLocal-first SSH mode is active. ` +
+					`Unsuffixed read, write, edit, bash, grep, find, and ls tools and user ! commands run LOCALLY in ${localCwd}. ` +
+					`Use read-ssh, write-ssh, edit-ssh, bash-ssh, grep-ssh, find-ssh, and ls-ssh only for the SSH project ` +
+					`${remote.remoteCwd} on '${remote.projectRef.serverName}' (${remote.target}). ` +
+					`Paths for -ssh tools are remote POSIX paths. read-ssh still checks advertised skill paths locally first. ` +
+					`Never confuse local files with remote files. ` +
+					(startupWarning ? `SSH startup warning: ${startupWarning}. SSH tools reconnect automatically. ` : ""),
+			};
+		}
 		// Preserve advertised local skill paths, including project/package skills.
 		const replaced = event.systemPrompt.replaceAll(`Current working directory: ${localCwd}`, `Current working directory: ${remote.remoteCwd}`);
 		const warning = startupWarning
@@ -234,7 +311,13 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			: "";
 		return {
 			systemPrompt:
-				`${replaced}\n\nSSH remote mode is active. The current project root is ${remote.remoteCwd} on the remote server ` +
+				`${replaced}\n\n` +
+				(mode === "ssh-local"
+					? `SSH with local access is active. Unsuffixed grep, find, and ls also run remotely. ` +
+						`Use read-local, write-local, edit-local, bash-local, grep-local, find-local, and ls-local for LOCAL files in ${localCwd}. ` +
+						`User ! commands run remotely. Never confuse local files with remote files. `
+					: "") +
+				`SSH remote mode is active. The current project root is ${remote.remoteCwd} on the remote server ` +
 				`'${remote.projectRef.serverName}' (${remote.target}); the read, write, edit, and bash tools operate there transparently ` +
 				`over a persistent SSH connection. Use POSIX paths under ${remote.remoteCwd} for project files.${warning} ` +
 				`For available skills and their supporting files, use read with their advertised paths unchanged: ` +
