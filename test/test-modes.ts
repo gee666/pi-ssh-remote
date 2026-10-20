@@ -12,6 +12,8 @@ const oldHome = process.env.HOME;
 process.env.HOME = root;
 const { default: extension } = await import("../src/index.ts");
 const { CONFIG_PATH, INHERITED_PROJECT_ENV } = await import("../src/config.ts");
+const { FriendlySshError } = await import("../src/errors.ts");
+const { RemoteFsRouter } = await import("../src/remote-fs.ts");
 const oldInherited = process.env[INHERITED_PROJECT_ENV];
 const remoteDir = path.join(root, "remote");
 await mkdir(remoteDir);
@@ -34,19 +36,27 @@ function harness(flags: string[], inherited = false) {
 	const tools = new Map<string, ToolDefinition>();
 	const handlers = new Map<string, Function>();
 	const registeredFlags: string[] = [];
+	const commands = new Map<string, { handler: Function }>();
+	const messages: { content: string }[] = [];
+	const notifications: string[] = [];
+	const selections: (string | undefined)[] = [];
+	const inputs: (string | undefined)[] = [];
 	let active = ["read", "write", "edit", "bash"];
 	const pi = {
 		registerFlag(name: string) { registeredFlags.push(name); },
+		registerCommand(name: string, command: { handler: Function }) { commands.set(name, command); },
+		sendMessage(message: { content: string }) { messages.push(message); },
 		getFlag(name: string) { return flags.includes(name); },
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
 		getActiveTools() { return active; },
 		setActiveTools(names: string[]) { active = names; },
 		on(name: string, handler: Function) { handlers.set(name, handler); },
 	} as unknown as ExtensionAPI;
-	const ctx = { hasUI: false, ui: { setTitle() {}, setStatus() {}, notify() {} } } as unknown as ExtensionContext;
+	const ctx = { hasUI: false, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus() {}, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
 	extension(pi);
 	return {
-		tools, registeredFlags, active: () => active,
+		pi, tools, registeredFlags, messages, notifications, selections, inputs, ctx, active: () => active,
+		command: (name: string, args = "") => commands.get(name)!.handler(args, ctx),
 		start: () => handlers.get("session_start")!({}, ctx),
 		stop: () => handlers.get("session_shutdown")!({}, ctx),
 		bash: () => handlers.get("user_bash")!({}, ctx),
@@ -113,6 +123,223 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.match(h.prompt(), /Choose only one/);
 			} finally { await h.stop(); }
 		});
+		await t.test("commands activate SSH from a local session and change access without clearing context", async () => {
+			const h = harness([]);
+			try {
+				await h.start();
+				assert.equal(h.tools.size, 0);
+				await h.command("ssh");
+				assert.match(await h.run("bash", { command: "pwd" }), new RegExp(remoteDir));
+				assert.match(h.messages.at(-1)!.content, /context is unchanged/);
+				await h.command("ssh:include-local");
+				assert.ok(h.active().includes("bash-local"));
+				assert.match(await h.run("bash-local", { command: "pwd" }), new RegExp(process.cwd()));
+				await h.command("ssh:bash", "printf REMOTE_COMMAND");
+				assert.match(h.messages.at(-1)!.content, /REMOTE_COMMAND/);
+				await h.command("ssh:bash-local", "printf LOCAL_COMMAND");
+				assert.match(h.messages.at(-1)!.content, /LOCAL_COMMAND/);
+				await h.command("ssh:exclude-local");
+				assert.ok(!h.active().some((name) => name.endsWith("-local")));
+				assert.match(h.messages.at(-1)!.content, /local tools are disabled/);
+			} finally { await h.stop(); }
+		});
+		await t.test("switches server and CWD, and a failed switch leaves tools on the previous connection", async () => {
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				const config = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
+				const nextDir = path.join(remoteDir, "another project");
+				await mkdir(nextDir, { recursive: true });
+				await writeFile(path.join(nextDir, "next.txt"), "NEXT_SERVER_CWD");
+				config.second = { ...config.test, projects: [{ title: "Next", path: nextDir }, { title: "Missing", path: path.join(root, "missing") }] };
+				await writeFile(CONFIG_PATH, JSON.stringify(config));
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.selections.push("second", `1. Next (${nextDir})`);
+				await h.command("ssh");
+				assert.match(await h.run("read", { path: "next.txt" }), /NEXT_SERVER_CWD/);
+				assert.ok(h.prompt().includes(nextDir));
+				assert.match(h.messages.at(-1)!.content, /'second'/);
+				h.selections.push("second", `2. Missing (${path.join(root, "missing")})`);
+				await h.command("ssh");
+				assert.match(await h.run("read", { path: "next.txt" }), /NEXT_SERVER_CWD/);
+				delete config.second;
+				await writeFile(CONFIG_PATH, JSON.stringify(config));
+			} finally { await h.stop(); }
+		});
+		await t.test("interactive selection lists servers before paths and cancellation preserves connection", async () => {
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				const offered: string[][] = [];
+				h.ctx.ui.select = (async (_title: string, options: string[]) => { offered.push(options); return offered.length === 1 ? "test" : undefined; }) as typeof h.ctx.ui.select;
+				await h.command("ssh");
+				assert.deepEqual(offered[0], ["test"]);
+				assert.ok(offered[1].includes("Enter a new path"));
+				assert.match(await h.run("bash", { command: "pwd" }), new RegExp(remoteDir));
+			} finally { await h.stop(); }
+		});
+		await t.test("connections without folders prompt after connecting, save home, and allow new CWD input", async () => {
+			const original = await readFile(CONFIG_PATH, "utf8");
+			const config = JSON.parse(original);
+			delete config.test.projects;
+			await writeFile(CONFIG_PATH, JSON.stringify(config));
+			const h = harness(["ssh"]);
+			try {
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.selections.push("test");
+				h.inputs.push("");
+				await h.start();
+				assert.ok(h.prompt().includes(root));
+				assert.ok(JSON.parse(await readFile(CONFIG_PATH, "utf8")).test.projects.some((p: { path: string }) => p.path === root));
+				h.inputs.push(remoteDir);
+				await h.command("ssh:cwd");
+				assert.match(await h.run("read", { path: "remote.txt" }), /REMOTE_ONLY/);
+				assert.ok(JSON.parse(await readFile(CONFIG_PATH, "utf8")).test.projects.some((p: { path: string }) => p.path === remoteDir));
+			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
+		});
+		await t.test("local-first include and exclude retire stale aliases without hiding unrelated tools", async () => {
+			const h = harness(["ssh-local-first"]);
+			try {
+				await h.start();
+				const unrelated = { ...h.tools.get("bash")!, name: "unrelated-tool" };
+				h.pi.registerTool(unrelated);
+				h.pi.setActiveTools([...h.active(), unrelated.name]);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), process.cwd());
+				assert.equal((await h.run("bash-ssh", { command: "pwd" })).trim(), remoteDir);
+				assert.equal(h.bash(), undefined);
+
+				for (const command of ["ssh:include-local", "ssh:exclude-local", "ssh:include-local"]) {
+					await h.command(command);
+					const includeLocal = command === "ssh:include-local";
+					assert.deepEqual([...h.active()].sort(), [
+						...all, ...(includeLocal ? all.map((name) => name + "-local") : []), unrelated.name,
+					].sort());
+					assert.equal(h.tools.get(unrelated.name), unrelated);
+					assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+					assert.match(await h.run("read", { path: "remote.txt" }), /REMOTE_ONLY/);
+					assert.ok(h.bash(), "user bash switches from local to remote");
+					assert.ok(!h.prompt().includes("Local-first SSH mode is active"));
+					if (includeLocal) {
+						assert.equal((await h.run("bash-local", { command: "pwd" })).trim(), process.cwd());
+						assert.match(await h.run("read-local", { path: localFile }), /LOCAL_ONLY/);
+					}
+				}
+			} finally { await h.stop(); }
+		});
+		await t.test("retryable switch failures preserve the previous connection instead of tolerating offline startup", async (t) => {
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				const toolsBefore = new Map(h.tools);
+				const activeBefore = [...h.active()];
+				const inheritedBefore = process.env[INHERITED_PROJECT_ENV];
+				const promptBefore = h.prompt();
+				t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async () => {
+					throw new FriendlySshError("Injected temporary network failure", "connection", true);
+				});
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.selections.push("test", `1. test (${remoteDir})`);
+				await h.command("ssh");
+				assert.ok(h.notifications.includes("Injected temporary network failure"));
+				assert.equal(h.messages.length, 0, "a failed switch is not announced as successful");
+				assert.deepEqual(h.active(), activeBefore);
+				for (const [name, tool] of toolsBefore) assert.equal(h.tools.get(name), tool);
+				assert.equal(process.env[INHERITED_PROJECT_ENV], inheritedBefore);
+				assert.equal(h.prompt(), promptBefore);
+				assert.match(await h.run("read", { path: "remote.txt" }), /REMOTE_ONLY/);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+			} finally { await h.stop(); }
+		});
+		await t.test("registration failure during a server switch restores previous definitions and permits retry", async (t) => {
+			const original = await readFile(CONFIG_PATH, "utf8");
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				const config = JSON.parse(original);
+				const nextDir = path.join(root, "registration candidate");
+				await mkdir(nextDir, { recursive: true });
+				await writeFile(path.join(nextDir, "candidate.txt"), "CANDIDATE_ONLY\n");
+				config.candidate = { ...config.test, projects: [{ title: "Candidate", path: nextDir }] };
+				await writeFile(CONFIG_PATH, JSON.stringify(config));
+				const toolsBefore = new Map(h.tools);
+				const activeBefore = [...h.active()];
+				const inheritedBefore = process.env[INHERITED_PROJECT_ENV];
+				const promptBefore = h.prompt();
+				const register = h.pi.registerTool.bind(h.pi);
+				const attempted: string[] = [];
+				let failed = false;
+				t.mock.method(h.pi, "registerTool", (tool: ToolDefinition) => {
+					attempted.push(tool.name);
+					if (tool.name === "edit" && !failed) {
+						failed = true;
+						throw new Error("Injected registration failure");
+					}
+					register(tool);
+				});
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.selections.push("candidate", `1. Candidate (${nextDir})`);
+				await h.command("ssh");
+				assert.equal(failed, true);
+				assert.deepEqual(attempted.slice(0, 3), ["read", "write", "edit"], "failure follows partial replacement");
+				assert.ok(h.notifications.includes("Injected registration failure"));
+				assert.equal(h.messages.length, 0);
+				assert.deepEqual(h.active(), activeBefore);
+				for (const [name, tool] of toolsBefore) assert.equal(h.tools.get(name), tool);
+				assert.equal(process.env[INHERITED_PROJECT_ENV], inheritedBefore);
+				assert.equal(h.prompt(), promptBefore);
+				assert.match(await h.run("read", { path: "remote.txt" }), /REMOTE_ONLY/);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+
+				h.selections.push("candidate", `1. Candidate (${nextDir})`);
+				await h.command("ssh");
+				assert.match(await h.run("read", { path: "candidate.txt" }), /CANDIDATE_ONLY/);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), nextDir);
+				assert.equal(process.env[INHERITED_PROJECT_ENV], `candidate::${nextDir}`);
+				assert.match(h.messages.at(-1)!.content, /'candidate'/);
+			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
+		});
+		for (const initialMode of ["ssh-local-first", "ssh-local"]) {
+			await t.test(`${initialMode} restores mode and active aliases after partial registration failure`, async (t) => {
+				const h = harness([initialMode]);
+				try {
+					await h.start();
+					const toolsBefore = new Map(h.tools);
+					const activeBefore = [...h.active()];
+					const promptBefore = h.prompt();
+					const inheritedBefore = process.env[INHERITED_PROJECT_ENV];
+					const register = h.pi.registerTool.bind(h.pi);
+					let failed = false;
+					t.mock.method(h.pi, "registerTool", (tool: ToolDefinition) => {
+						if (tool.name === "edit" && !failed) {
+							failed = true;
+							throw new Error("Injected mode registration failure");
+						}
+						register(tool);
+					});
+					const command = initialMode === "ssh-local-first" ? "ssh:include-local" : "ssh:exclude-local";
+					await h.command(command);
+					assert.equal(failed, true);
+					assert.ok(h.notifications.includes("Injected mode registration failure"));
+					assert.equal(h.messages.length, 0);
+					assert.deepEqual(h.active(), activeBefore);
+					for (const [name, tool] of toolsBefore) assert.equal(h.tools.get(name), tool);
+					assert.equal(h.prompt(), promptBefore);
+					assert.equal(process.env[INHERITED_PROJECT_ENV], inheritedBefore);
+					const localFirst = initialMode === "ssh-local-first";
+					assert.equal(h.bash() === undefined, localFirst);
+					assert.equal((await h.run("bash", { command: "pwd" })).trim(), localFirst ? process.cwd() : remoteDir);
+					assert.match(await h.run(localFirst ? "read-ssh" : "read", { path: "remote.txt" }), /REMOTE_ONLY/);
+					assert.match(await h.run(localFirst ? "read" : "read-local", { path: localFile }), /LOCAL_ONLY/);
+
+					await h.command(command);
+					assert.deepEqual([...h.active()].sort(), [
+						...all, ...(localFirst ? all.map((name) => name + "-local") : []),
+					].sort());
+					assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+				} finally { await h.stop(); }
+			});
+		}
 		await writeFile(CONFIG_PATH, "{}");
 		for (const mode of ["ssh", "ssh-local", "ssh-local-first"]) {
 			await t.test(`${mode} fails closed without breaking explicit local access`, async () => {

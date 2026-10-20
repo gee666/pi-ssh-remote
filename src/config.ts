@@ -4,7 +4,8 @@
  * earlier versions of this extension.
  */
 
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { open, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -78,7 +79,7 @@ function validateConfig(value: unknown): ConfigFile {
 	const root = asObject(value);
 	if (!root) throw new Error(`SSH remote settings in ${CONFIG_PATH} must be a JSON object of servers.`);
 
-	const config: ConfigFile = {};
+	const config: ConfigFile = Object.create(null);
 	for (const [serverName, rawServer] of Object.entries(root)) {
 		const serverObj = asObject(rawServer);
 		if (!serverObj) throw new Error(`SSH remote server '${serverName}' in ${CONFIG_PATH} must be an object.`);
@@ -118,6 +119,26 @@ function validateConfig(value: unknown): ConfigFile {
 	return config;
 }
 
+function parseConfig(raw: string): ConfigFile {
+	// Tolerate a UTF-8 BOM: PowerShell and Notepad routinely add one, and
+	// strict JSON.parse rejects it.
+	raw = raw.replace(/^\uFEFF/, "");
+	if (!raw.trim()) return Object.create(null);
+
+	try {
+		return validateConfig(JSON.parse(raw));
+	} catch (error) {
+		if (error instanceof SyntaxError) throw new Error(`SSH remote settings in ${CONFIG_PATH} are not valid JSON. Fix the file and try again.`);
+		throw error;
+	}
+}
+
+function remoteProject(serverName: string, server: ServerConfig, project: ProjectConfig): RemoteProject {
+	const host = serverHost(serverName, server);
+	const label = truncateMiddle(`${project.title} (${serverName} <${host}> - ${project.path})`);
+	return { serverName, server, project, label };
+}
+
 export async function loadProjects(): Promise<RemoteProject[]> {
 	let raw: string;
 	try {
@@ -125,32 +146,65 @@ export async function loadProjects(): Promise<RemoteProject[]> {
 	} catch {
 		return [];
 	}
-	// Tolerate a UTF-8 BOM: PowerShell and Notepad routinely add one, and
-	// strict JSON.parse rejects it.
-	raw = raw.replace(/^\uFEFF/, "");
-	if (!raw.trim()) return [];
-
-	let config: ConfigFile;
-	try {
-		config = validateConfig(JSON.parse(raw));
-	} catch (error) {
-		if (error instanceof SyntaxError) throw new Error(`SSH remote settings in ${CONFIG_PATH} are not valid JSON. Fix the file and try again.`);
-		throw error;
-	}
-
+	const config = parseConfig(raw);
 	const projects: RemoteProject[] = [];
 	for (const [serverName, server] of Object.entries(config)) {
-		for (const project of server.projects ?? []) {
-			const host = serverHost(serverName, server);
-			const label = truncateMiddle(`${project.title} (${serverName} <${host}> - ${project.path})`);
-			projects.push({ serverName, server, project, label });
+		const serverProjects = server.projects?.length ? server.projects : [{ title: "Home", path: "." }];
+		for (const project of serverProjects) {
+			projects.push(remoteProject(serverName, server, project));
 		}
 	}
 	return projects;
 }
 
+// Serialize saves in this process so simultaneous selections do not lose paths.
+let pendingSave: Promise<void> = Promise.resolve();
+
+/** Append a path without rewriting authentication or other server settings. */
+export function saveProjectPath(serverName: string, projectPath: string): Promise<void> {
+	const save = pendingSave.then(async () => {
+		if (typeof projectPath !== "string" || !projectPath.trim()) {
+			throw new Error("SSH remote project path must be a non-empty string.");
+		}
+		// Unlike loading, saving must not ignore read or validation errors.
+		const config = parseConfig(await readFile(CONFIG_PATH, "utf8"));
+		const server = Object.hasOwn(config, serverName) ? config[serverName] : undefined;
+		if (!server) throw new Error(`SSH remote server '${serverName}' is not configured in ${CONFIG_PATH}.`);
+		if (server.projects?.some((project) => project.path === projectPath)) return;
+		server.projects = [...(server.projects ?? []), {
+			title: path.posix.basename(projectPath) || projectPath,
+			path: projectPath,
+		}];
+
+		// Use an exclusive, private file beside the destination for atomic rename.
+		const temporaryPath = `${CONFIG_PATH}.${randomUUID()}.tmp`;
+		const file = await open(temporaryPath, "wx", 0o600);
+		try {
+			try {
+				await file.writeFile(`${JSON.stringify(config, null, "\t")}\n`, "utf8");
+				await file.sync();
+			} finally {
+				await file.close();
+			}
+			await rename(temporaryPath, CONFIG_PATH);
+		} finally {
+			await rm(temporaryPath, { force: true });
+		}
+	});
+	pendingSave = save.catch(() => {});
+	return save;
+}
+
 function matchExactProject(projects: RemoteProject[], serverName: string, projectPath: string): RemoteProject | undefined {
-	return projects.find((entry) => entry.serverName === serverName && entry.project.path === projectPath);
+	const exact = projects.find((entry) => entry.serverName === serverName && entry.project.path === projectPath);
+	if (exact) return exact;
+	// Subagents inherit the resolved cwd, which need not be a saved project.
+	const configured = projects.find((entry) => entry.serverName === serverName);
+	if (!configured || !path.posix.isAbsolute(projectPath)) return undefined;
+	return remoteProject(serverName, configured.server, {
+		title: path.posix.basename(projectPath) || projectPath,
+		path: projectPath,
+	});
 }
 
 export function matchProject(projects: RemoteProject[], wanted: string): RemoteProject | undefined {

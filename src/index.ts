@@ -25,9 +25,11 @@ import {
 	loadProjects,
 	matchInheritedProject,
 	matchProject,
+	saveProjectPath,
 	type RemoteProject,
 } from "./config.ts";
 import { RemoteConnection } from "./connection.ts";
+import { chooseRemotePath } from "./path-picker.ts";
 import { RemoteFsRouter } from "./remote-fs.ts";
 import { withLocalSkillReads } from "./skill-read.ts";
 import { createRemoteSearchTools } from "./search-tools.ts";
@@ -87,36 +89,67 @@ function failClosedBashOps(message: string): BashOperations {
 	};
 }
 
-async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext): Promise<RemoteProject> {
+async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext, interactive = false): Promise<RemoteProject> {
 	const projects = await loadProjects();
 	if (projects.length === 0) {
-		throw new Error(`SSH remote settings were not found. Add at least one server and project to ${CONFIG_PATH}.`);
+		throw new Error(`SSH remote settings were not found. Add at least one server to ${CONFIG_PATH}.`);
 	}
 
-	const inheritedRequested = process.env[INHERITED_PROJECT_ENV];
+	const inheritedRequested = interactive ? undefined : process.env[INHERITED_PROJECT_ENV];
 	if (inheritedRequested) {
 		const match = matchInheritedProject(projects, inheritedRequested);
 		if (!match) throw new Error(`SSH remote project '${inheritedRequested}' from ${INHERITED_PROJECT_ENV} was not found in ${CONFIG_PATH}.`);
 		return match;
 	}
 
-	const requested = pi.getFlag("ssh-remote-project") as string | undefined;
+	const requested = interactive ? undefined : pi.getFlag("ssh-remote-project") as string | undefined;
 	if (requested) {
 		const match = matchProject(projects, requested);
 		if (!match) throw new Error(`SSH remote project '${requested}' was not found in ${CONFIG_PATH}.`);
 		return match;
 	}
 
-	if (projects.length === 1) return projects[0];
+	if (!ctx.hasUI && projects.length === 1) return projects[0];
 	if (!ctx.hasUI) {
 		throw new Error(`Multiple SSH remote projects are configured. In non-interactive mode set --ssh-remote-project or ${INHERITED_PROJECT_ENV}.`);
 	}
 
-	const labels = projects.map((project) => project.label);
-	const choice = await ctx.ui.select("Select SSH remote project", labels);
-	const selected = projects[labels.indexOf(choice ?? "")];
-	if (!selected) throw new Error("No SSH remote project selected.");
-	return selected;
+	const servers = [...new Set(projects.map((project) => project.serverName))];
+	const server = await ctx.ui.select("Select SSH connection", servers);
+	if (!server) throw new Error("SSH selection cancelled.");
+	const choices = projects.filter((project) => project.serverName === server);
+	const saved = choices[0].server.projects ?? [];
+	const labels = saved.map((project, index) => `${index + 1}. ${project.title} (${project.path})`);
+	const choice = saved.length ? await ctx.ui.select(`Remote directory on ${server}`, [...labels, "Enter a new path", "Use home directory"]) : "Enter a new path";
+	if (!choice) throw new Error("SSH selection cancelled.");
+	const index = labels.indexOf(choice);
+	if (index >= 0) return choices[index];
+	const home = { ...choices[0], project: { title: "Home", path: "." }, label: `${server}: home directory` };
+	if (choice === "Use home directory") return home;
+	return enterPath(ctx, home);
+}
+
+async function enterPath(ctx: ExtensionContext, project: RemoteProject, initial = ""): Promise<RemoteProject> {
+	const probe = new RemoteConnection({ ...project, project: { title: "Home", path: "." } });
+	try {
+		await new RemoteFsRouter(probe).resolveProjectCwd();
+		let prefill = initial;
+		for (;;) {
+			const entered = await chooseRemotePath(ctx, probe, prefill);
+			if (entered === undefined) throw new Error("SSH selection cancelled.");
+			probe.projectRef.project.path = entered || ".";
+			try {
+				const remotePath = await new RemoteFsRouter(probe).resolveProjectCwd();
+				return { ...project, project: { title: remotePath, path: remotePath }, label: `${project.serverName}: ${remotePath}` };
+			} catch (error) {
+				if (!isFriendly(error) || error.kind !== "remote-path") throw error;
+				ctx.ui.notify(error.message, "error");
+				prefill = entered;
+			}
+		}
+	} finally {
+		probe.dispose();
+	}
 }
 
 export default function piSshRemote(pi: ExtensionAPI) {
@@ -144,32 +177,19 @@ export default function piSshRemote(pi: ExtensionAPI) {
 	let connection: RemoteConnection | null = null;
 	let fatalStartupError: string | null = null;
 	let startupWarning: string | null = null;
+	let searchEnabled = false;
+	let installedTools: ToolDefinition[] = [];
 	const localCwd = process.cwd();
 	let skillPaths: string[] = [];
 	const getSkillPaths = () => skillPaths;
 
-	pi.on("session_start", async (_event, ctx) => {
-		const inheritedProject = process.env[INHERITED_PROJECT_ENV];
-		const flags = (["ssh", "ssh-local", "ssh-local-first"] as const).filter((name) => pi.getFlag(name) === true);
-		if (flags.length === 0 && !inheritedProject) return;
-		mode = flags.includes("ssh-local-first") ? "ssh-local-first" : flags.includes("ssh-local") ? "ssh-local" : "ssh";
-		if (mode !== "ssh") {
-			for (const tool of localTools(localCwd)) {
-				pi.registerTool(namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`));
-			}
-		}
-
+	async function activate(ctx: ExtensionContext, selected: RemoteProject, startup = false) {
+		const previous = connection;
+		let candidate: RemoteConnection | null = null;
 		try {
-			if (flags.length > 1) throw new Error("Choose only one of --ssh, --ssh-local, or --ssh-local-first.");
-			fatalStartupError = null;
-			startupWarning = null;
-			connection?.dispose();
-			connection = null;
-			const project = await selectProject(pi, ctx);
-			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject(project);
-
+			const project = selected;
 			const remote = new RemoteConnection(project);
-			connection = remote;
+			candidate = remote;
 			const remoteFs = new RemoteFsRouter(remote);
 			remoteFs.onFallback = (reason) => {
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote: ${reason}`, "warning");
@@ -210,7 +230,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 				// Setup problems (bad auth, bad key, missing path, host-key
 				// mismatch) fail closed: registering tools against a wrong or
 				// unknown directory would let the agent damage the wrong files.
-				if (!friendly.retryable) throw friendly;
+				if (!friendly.retryable || !startup) throw friendly;
 				// A transient network problem should not kill the session if we
 				// already know the exact remote directory.
 				if (!project.project.path.startsWith("/")) {
@@ -226,16 +246,36 @@ export default function piSshRemote(pi: ExtensionAPI) {
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote is not reachable yet; pi will keep running and reconnect automatically. ${friendly.message}`, "error");
 			}
 
+			if (!startupWarning) {
+				try { await saveProjectPath(project.serverName, remote.remoteCwd); }
+				catch (error) { ctx.ui.notify(`SSH connected, but could not save directory: ${String(error)}`, "warning"); }
+			}
+			const withSearch = searchEnabled || mode !== "ssh" || !startup;
 			const remoteTools: ToolDefinition[] = [
 				withLocalSkillReads(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }), localCwd, getSkillPaths),
 				createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remoteFs) }),
 				createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remoteFs) }),
 				createBashTool(remote.remoteCwd, { operations: createRemoteBashOps(remote, localCwd) }),
-				...(mode === "ssh" ? [] : createRemoteSearchTools(remote, localCwd)),
+				...(withSearch ? createRemoteSearchTools(remote, localCwd) : []),
 			];
-			for (const tool of remoteTools) {
-				pi.registerTool(namedTool(tool, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${remote.remoteCwd}.`));
+			const nextTools = [
+				...(mode === "ssh" ? [] : localTools(localCwd).map((tool) => namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`))),
+				...remoteTools.map((tool) => namedTool(tool, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${remote.remoteCwd}.`)),
+			];
+			const activeBefore = pi.getActiveTools();
+			try {
+				for (const tool of nextTools) pi.registerTool(tool);
+			} catch (error) {
+				for (const tool of installedTools.length ? installedTools : localTools(localCwd)) pi.registerTool(tool);
+				pi.setActiveTools(activeBefore);
+				throw error;
 			}
+			installedTools = nextTools;
+			searchEnabled = withSearch;
+			connection = remote;
+			previous?.dispose();
+			fatalStartupError = null;
+			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject({ ...project, project: { ...project.project, path: remote.remoteCwd } });
 
 			ctx.ui.setTitle(`SSH ${project.project.title}`);
 			if (!startupWarning) {
@@ -244,25 +284,95 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			candidate?.dispose();
+			if (!startup) throw error;
 			fatalStartupError = message;
-			connection?.dispose();
 			connection = null;
 			// Fail closed: replace the built-in tools with ones that refuse to
 			// run, so the agent cannot mistake the local directory for the
 			// remote project.
+			if (mode !== "ssh") for (const tool of localTools(localCwd)) pi.registerTool(namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`));
 			registerFailClosedTools(pi, localCwd, message, getSkillPaths, mode);
 			redError(message);
 			ctx.ui.setStatus("ssh-remote", dimStatus(ctx, "SSH setup failed"));
 			if (ctx.hasUI) ctx.ui.notify(message, "error");
 		}
-		if (mode !== "ssh") {
-			// Overriding an inactive built-in does not activate it. Mixed modes
-			// expose all seven tools on both machines, including search tools.
-			const names = localTools(localCwd).map((tool) => tool.name);
-			const suffix = mode === "ssh-local" ? "-local" : "-ssh";
-			pi.setActiveTools([...new Set([...pi.getActiveTools(), ...names, ...names.map((name) => name + suffix)])]);
+		// Retire aliases bound to the previous connection or mode before exposing
+		// the current set. Keep unrelated extensions' tools unchanged.
+		const names = localTools(localCwd).map((tool) => tool.name);
+		const aliases = names.flatMap((name) => [name + "-local", name + "-ssh"]);
+		const active = pi.getActiveTools().filter((name) => !aliases.includes(name));
+		const suffix = mode === "ssh-local" ? "-local" : "-ssh";
+		pi.setActiveTools([...new Set([...active, ...(searchEnabled ? names : []), ...(mode === "ssh" ? [] : [...names, ...names.map((name) => name + suffix)])])]);
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		const flags = (["ssh", "ssh-local", "ssh-local-first"] as const).filter((name) => pi.getFlag(name) === true);
+		if (flags.length === 0 && !process.env[INHERITED_PROJECT_ENV]) return;
+		mode = flags.includes("ssh-local-first") ? "ssh-local-first" : flags.includes("ssh-local") ? "ssh-local" : "ssh";
+		startupWarning = null;
+		try {
+			if (flags.length > 1) throw new Error("Choose only one of --ssh, --ssh-local, or --ssh-local-first.");
+			await activate(ctx, await selectProject(pi, ctx), true);
+		} catch (error) {
+			fatalStartupError = error instanceof Error ? error.message : String(error);
+			if (mode !== "ssh") for (const tool of localTools(localCwd)) pi.registerTool(namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`));
+			registerFailClosedTools(pi, localCwd, fatalStartupError, getSkillPaths, mode);
+			redError(fatalStartupError);
+			ctx.ui.notify(fatalStartupError, "error");
 		}
 	});
+
+	function inform(content: string) {
+		pi.sendMessage({ customType: "ssh-remote", content, display: true });
+	}
+
+	for (const command of ["ssh", "ssh:cwd", "ssh:include-local", "ssh:exclude-local"] as const) {
+		pi.registerCommand(command, {
+			description: command === "ssh" ? "Connect or switch SSH server and directory without clearing context" : command === "ssh:cwd" ? "Change remote directory with completion" : command === "ssh:include-local" ? "Enable local tools with -local suffix" : "Disable local tool access",
+			handler: async (_args, ctx) => {
+				await ctx.waitForIdle();
+				const oldMode = mode;
+				const oldWarning = startupWarning;
+				try {
+					if (command !== "ssh" && !connection) throw new Error("Connect using /ssh first.");
+					let project: RemoteProject;
+					if (command === "ssh") project = await selectProject(pi, ctx, true);
+					else if (command === "ssh:cwd") project = await enterPath(ctx, connection!.projectRef, connection!.remoteCwd + "/");
+					else {
+						mode = command === "ssh:include-local" ? "ssh-local" : "ssh";
+						project = { ...connection!.projectRef, project: { ...connection!.projectRef.project, path: connection!.remoteCwd } };
+					}
+					startupWarning = null;
+					await activate(ctx, project);
+					inform(`SSH connection switched to '${connection!.projectRef.serverName}', remote CWD ${connection!.remoteCwd}. Previous conversation context is unchanged. Do not assume files or shell state from the previous location still apply. ${mode === "ssh-local" ? `Local tools ending in -local are enabled in ${localCwd}.` : mode === "ssh-local-first" ? "Unsuffixed tools remain local; use -ssh tools remotely." : "Tools run remotely; local tools are disabled."}`);
+				} catch (error) {
+					mode = oldMode;
+					startupWarning = oldWarning;
+					if (connection) ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${connection.projectRef.serverName}:${connection.remoteCwd}`));
+					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+			},
+		});
+	}
+
+	for (const local of [false, true]) {
+		pi.registerCommand(local ? "ssh:bash-local" : "ssh:bash", {
+			description: `Run a ${local ? "local" : "remote"} bash command and include its output in model context`,
+			handler: async (args, ctx) => {
+				await ctx.waitForIdle();
+				if (!args.trim()) { ctx.ui.notify("Provide a bash command.", "warning"); return; }
+				try {
+					if (!local && !connection) throw new Error("Connect using /ssh first.");
+					const tool = local ? createBashTool(localCwd) : createBashTool(connection!.remoteCwd, { operations: createRemoteBashOps(connection!, localCwd) });
+					const result = await tool.execute("ssh-command", { command: args, timeout: 60 }, undefined);
+					inform(`${local ? `LOCAL ${localCwd}` : `SSH ${connection!.projectRef.serverName}:${connection!.remoteCwd}`}\n$ ${args}\n${result.content.map((part) => part.type === "text" ? part.text : "").join("\n")}`);
+				} catch (error) {
+					inform(`${local ? "Local" : "SSH"} bash command failed\n$ ${args}\n${String(error)}`);
+				}
+			},
+		});
+	}
 
 	pi.on("session_shutdown", () => {
 		connection?.dispose();

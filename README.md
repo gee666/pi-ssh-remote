@@ -2,7 +2,7 @@
 
 `oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a remote SSH project instead of the local filesystem. The agent works as if it were running natively on the remote server. Available skills are the exception: `read` checks their advertised paths locally first, then falls back to SSH if the local file is absent. This also covers supporting files inside directory skills. Ordinary project reads, writes, edits, and shell commands remain remote.
 
-The extension is inert unless pi starts with `--ssh`, `--ssh-local`, `--ssh-local-first`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` set. Mixed local/SSH access requires an explicit startup flag; the environment variable alone keeps the existing SSH-only behavior.
+The extension starts locally unless pi starts with `--ssh`, `--ssh-local`, `--ssh-local-first`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` set. Use `/ssh` at any time to connect or switch servers without clearing the conversation.
 
 ## How it works
 
@@ -26,6 +26,23 @@ pi install npm:oira666_pi-ssh-remote
 pi --ssh
 ```
 
+First choose a connection, then choose one of its saved remote directories, enter a new path, or use the remote home directory. A connection can have no `projects` at all. In that case pi connects and offers a path input. Leave it empty to use home.
+
+The terminal path input supports Tab completion and shows directories only, including hidden directories. Paths with spaces are supported. Enter accepts a directory; Escape cancels. RPC clients use a plain path input instead. Successfully selected paths are saved under the connection's `projects` in `~/.pi/agent/ssh-remote-config.json` and offered next time. Existing titles and connection settings are preserved.
+
+### Session commands
+
+| Command | Action |
+| --- | --- |
+| `/ssh` | Connect from a local session, or switch connection and directory |
+| `/ssh:cwd` | Enter another remote directory with completion and directory hints |
+| `/ssh:include-local` | Enable local tools ending in `-local`, with unsuffixed tools remote |
+| `/ssh:exclude-local` | Disable local tool access and use remote tools by default |
+| `/ssh:bash <command>` | Run a remote bash command and add its output to the conversation |
+| `/ssh:bash-local <command>` | Run a local bash command and add its output to the conversation |
+
+Switches wait for the current agent run to finish. They keep the conversation and add a message telling the model which server and directory are now active. A failed or cancelled switch keeps the previous connection. Bash commands have a 60-second timeout and use the normal bash tool's output limits. `/ssh:bash-local` is an explicit local command and works even when local model tools are disabled.
+
 ### Mixed local and SSH access
 
 Choose one startup mode:
@@ -45,7 +62,7 @@ Every mixed-mode tool has the same arguments as its unsuffixed counterpart. For 
 
 Remote `grep` requires `rg` on the server's PATH. Remote `find` requires `fd` supporting `--no-require-git` and `--max-results`. Remote `ls` uses bash builtins. Search tools have a 60-second timeout and truncate output at 50KB. These extra requirements apply only to the mixed-mode search tools, not plain `--ssh`.
 
-The new modes are enabled only by their startup flags, never by a saved session or the inherited project environment variable. Pass only one mode flag. SSH-backed reads retain the local-first exception for advertised skills and their supporting files. Other explicit local tools access the local filesystem normally.
+The startup modes are enabled only by their startup flags, never by a saved session or the inherited project environment variable. Local access can also be enabled during a session with `/ssh:include-local`. Pass only one mode flag. SSH-backed reads retain the local-first exception for advertised skills and their supporting files. Other explicit local tools access the local filesystem normally.
 
 Select a configured project explicitly in any mode:
 
@@ -63,7 +80,7 @@ PI_CODING_AGENT_SSH_REMOTE_PROJECT='server-name::/exact/remote/project/path'
 
 This variable also selects and enables a project when starting pi yourself. The canonical format is `server-name::project-path`. JSON is also accepted for scripting, for example `{"serverName":"server-name","projectPath":"/exact/path"}`. Simple selectors (title, server name, path, label, 1-based index) are accepted too.
 
-In non-interactive modes (including `-p` / `--print`), the project must be unambiguous: a single configured project, `--ssh-remote-project`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT`. If it is ambiguous, the extension fails closed with a clear error instead of silently working on the local filesystem.
+In non-interactive modes (including `-p` / `--print`), the project must be unambiguous: a single configured project, `--ssh-remote-project`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT`. A connection without saved paths uses its home directory. If it is ambiguous, the extension fails closed with a clear error instead of silently working on the local filesystem.
 
 ## Configuration
 
@@ -90,7 +107,7 @@ Each top-level key is a server name. Fields (OpenSSH-style aliases accepted):
 - `identityFile` — path to a private key (`~` is expanded)
 - `passphrase` / `passphraseEnv` — for encrypted private keys
 - `password` / `passwordEnv` — password authentication, built in, no `sshpass` needed; prefer `passwordEnv` to keep secrets out of the file
-- `projects`: array of `{ "title": string, "path": string }`
+- `projects`: optional array of `{ "title": string, "path": string }`. Omit it or use `[]` to choose a directory after connecting.
 
 Project paths may be **absolute** (`/var/www/app`) or **relative to the remote home directory** (`www/app`). Absolute paths are recommended: they let pi start even while the server is temporarily unreachable.
 
