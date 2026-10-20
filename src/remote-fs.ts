@@ -388,7 +388,13 @@ export class RemoteFsRouter implements RemoteFs {
 	 */
 	async resolveProjectCwd(): Promise<string> {
 		this.remote.pathProblem = null;
-		const configured = this.remote.projectRef.project.path;
+		const resolved = await this.resolveDirectory(this.remote.projectRef.project.path);
+		this.remote.remoteCwd = resolved;
+		return resolved;
+	}
+
+	/** Validate a candidate without changing the active project's directory. */
+	async resolveDirectory(configured: string): Promise<string> {
 		let resolved: string;
 		try {
 			resolved = await this.realpathDir(configured);
@@ -402,7 +408,6 @@ export class RemoteFsRouter implements RemoteFs {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") throw await this.pathError(configured);
 			throw await this.diagnoseFailure(error);
 		}
-		this.remote.remoteCwd = resolved;
 		return resolved;
 	}
 

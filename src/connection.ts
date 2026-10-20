@@ -56,6 +56,8 @@ export class RemoteConnection {
 	private client: ClientType | null = null;
 	private sftp: SFTPWrapper | null = null;
 	private connecting: Promise<ClientType> | null = null;
+	private handshaking: { client: ClientType; cancel: () => void } | null = null;
+	private cancelBackoff: (() => void) | null = null;
 	private sftpOpening: Promise<SFTPWrapper> | null = null;
 	/** Set when the configured project path turned out to be invalid; fails all operations closed. */
 	pathProblem: FriendlySshError | null = null;
@@ -151,9 +153,10 @@ export class RemoteConnection {
 			let lastError: unknown;
 			for (let attempt = 0; attempt < RECONNECT_BACKOFF_MS.length; attempt++) {
 				try {
+					if (this.disposed) throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
 					const client = await this.connectOnce();
 					if (this.disposed) {
-						client.end();
+						client.destroy();
 						throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
 					}
 					this.client = client;
@@ -166,7 +169,16 @@ export class RemoteConnection {
 					if ((isFriendly(lastError) && !lastError.retryable) || this.disposed) break;
 					if (attempt < RECONNECT_BACKOFF_MS.length - 1) {
 						this.onStateChange?.("reconnecting");
-						await new Promise((resolve) => setTimeout(resolve, RECONNECT_BACKOFF_MS[attempt]));
+						await new Promise<void>((resolve) => {
+							if (this.disposed) return resolve();
+							const finish = () => {
+								clearTimeout(timer);
+								this.cancelBackoff = null;
+								resolve();
+							};
+							const timer = setTimeout(finish, RECONNECT_BACKOFF_MS[attempt]);
+							this.cancelBackoff = finish;
+						});
 					}
 				}
 			}
@@ -192,11 +204,33 @@ export class RemoteConnection {
 
 	private async connectOnce(): Promise<ClientType> {
 		const config = await this.buildConnectConfig();
+		if (this.disposed) throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
 		return await new Promise<ClientType>((resolve, reject) => {
 			const client = new Client();
 			let settled = false;
-			client.on("ready", () => {
+			const clearHandshake = () => {
+				if (this.handshaking?.client === client) this.handshaking = null;
+			};
+			const fail = (error: unknown) => {
+				if (settled) return;
 				settled = true;
+				clearHandshake();
+				reject(error);
+				// end() can leave a half-open socket waiting for an unresponsive peer.
+				try {
+					client.destroy();
+				} catch {
+					// Preserve the original connection error if teardown also fails.
+				}
+			};
+			this.handshaking = {
+				client,
+				cancel: () => fail(new FriendlySshError("SSH remote connection has been closed.", "connection", false)),
+			};
+			client.on("ready", () => {
+				if (settled) return;
+				settled = true;
+				clearHandshake();
 				// From now on, transport errors invalidate the cached client so
 				// the next operation reconnects.
 				client.on("error", () => this.invalidate(client));
@@ -204,19 +238,16 @@ export class RemoteConnection {
 				client.on("end", () => this.invalidate(client));
 				resolve(client);
 			});
-			client.on("error", (error) => {
-				if (!settled) {
-					settled = true;
-					reject(error);
-				}
-			});
+			// Keep the error listener after settlement to absorb teardown errors.
+			client.on("error", fail);
 			client.on("close", () => {
-				if (!settled) {
-					settled = true;
-					reject(new FriendlySshError(`SSH connection to ${this.target} closed during handshake.`, "connection", true));
-				}
+				fail(new FriendlySshError(`SSH connection to ${this.target} closed during handshake.`, "connection", true));
 			});
-			client.connect(config);
+			try {
+				client.connect(config);
+			} catch (error) {
+				fail(error);
+			}
 		});
 	}
 
@@ -334,6 +365,8 @@ export class RemoteConnection {
 
 	dispose(): void {
 		this.disposed = true;
+		this.handshaking?.cancel();
+		this.cancelBackoff?.();
 		this.invalidateCurrent();
 	}
 }

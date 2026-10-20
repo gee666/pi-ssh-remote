@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { startServer } from "./test-server.ts";
+import { getKeybindings } from "@earendil-works/pi-tui";
 
 await mkdir("tmp", { recursive: true });
 const root = await mkdtemp(path.resolve("tmp/modes-"));
@@ -21,7 +22,8 @@ await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
 const key = path.join(root, "hostkey");
 execFileSync("ssh-keygen", ["-t", "ed25519", "-f", key, "-N", "", "-q"], { timeout: 5000 });
 const port = 12223;
-const server = await startServer({ port, hostKeyPath: key, sandbox: root });
+let connectionLimit = Infinity;
+const server = await startServer({ port, hostKeyPath: key, sandbox: root, maxConnections: () => connectionLimit });
 await writeFile(CONFIG_PATH, JSON.stringify({ test: {
 	host: "127.0.0.1", port, user: "test", password: "testpass",
 	projects: [{ title: "test", path: remoteDir }],
@@ -205,7 +207,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				(h.ctx as { hasUI: boolean }).hasUI = true;
 				let resolves = 0;
 				let inputs = 0;
-				t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async () => { resolves++; throw new Error("must not wait for SSH before input"); });
+				t.mock.method(RemoteFsRouter.prototype, "resolveDirectory", async () => { resolves++; throw new Error("must not wait for SSH before input"); });
 				h.ctx.ui.input = async () => { inputs++; assert.equal(resolves, 0); return undefined; };
 				h.selections.push("test", "Enter a new path");
 				await h.command("ssh");
@@ -213,6 +215,62 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.equal(inputs, 2);
 				assert.equal(resolves, 0);
 			} finally { await h.stop(); }
+		});
+		await t.test("three saved CWD switches then new-path hints reuse one SSH connection on a one-login server", async () => {
+			const original = await readFile(CONFIG_PATH, "utf8");
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				const count = server.connectionCount();
+				connectionLimit = 1;
+				Object.assign(h.ctx, { hasUI: true, mode: "tui" });
+				const config = JSON.parse(original);
+				for (let i = 0; i < 3; i++) {
+					const saved = path.join(remoteDir, `saved-${i}`);
+					await mkdir(saved);
+					config.test.projects.push({ title: `Saved ${i}`, path: saved });
+				}
+				await writeFile(CONFIG_PATH, JSON.stringify(config));
+				for (let i = 0; i < 3; i++) {
+					const saved = config.test.projects[i + 1];
+					h.selections.push("test", `${i + 2}. ${saved.title} (${saved.path})`);
+					await h.command("ssh");
+					assert.equal((await h.run("bash", { command: "pwd" })).trim(), saved.path);
+				}
+				const next = path.join(remoteDir, "fourth directory");
+				await mkdir(next);
+				await writeFile(path.join(next, "fourth.txt"), "FOURTH_DIRECTORY");
+				let hintText = "";
+				h.ctx.ui.custom = (async (factory: Function) => {
+					let finish!: (value: unknown) => void;
+					const result = new Promise((resolve) => { finish = resolve; });
+					const component = factory({ requestRender() {} }, { fg: (_: string, text: string) => text }, getKeybindings(), finish);
+					try {
+						const deadline = Date.now() + 3000;
+						do {
+							hintText = component.render(120).join("\n");
+							if (!hintText.includes("Loading directories...")) break;
+							assert.ok(Date.now() < deadline, "hints did not load");
+							await new Promise((resolve) => setTimeout(resolve, 10));
+						} while (true);
+						assert.match(hintText, /remote\//, "hints must list home, not the current project");
+						assert.doesNotMatch(hintText, /Cannot fetch|failed/);
+						component.handleInput(next);
+						component.handleInput("\r");
+						return await result;
+					} finally { component.dispose(); }
+				}) as typeof h.ctx.ui.custom;
+				h.selections.push("test", "Enter a new path");
+				await h.command("ssh");
+				assert.equal(h.messages.length, 4);
+				assert.equal(server.connectionCount(), count, "directory changes must not open additional SSH transports");
+				assert.match(await h.run("read", { path: "fourth.txt" }), /FOURTH_DIRECTORY/);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), next);
+			} finally {
+				connectionLimit = Infinity;
+				await h.stop();
+				await writeFile(CONFIG_PATH, original);
+			}
 		});
 		await t.test("PuTTY import command updates by name, preserves paths, and does not activate SSH", async () => {
 			const original = await readFile(CONFIG_PATH, "utf8");
@@ -276,7 +334,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				const activeBefore = [...h.active()];
 				const inheritedBefore = process.env[INHERITED_PROJECT_ENV];
 				const promptBefore = h.prompt();
-				t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async () => {
+				t.mock.method(RemoteFsRouter.prototype, "resolveDirectory", async () => {
 					throw new FriendlySshError("Injected temporary network failure", "connection", true);
 				});
 				(h.ctx as { hasUI: boolean }).hasUI = true;

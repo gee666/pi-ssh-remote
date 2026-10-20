@@ -15,16 +15,23 @@ export function startServer(options: {
 	disableSftp?: boolean;
 	/** Emulate a broken jailshell: every exec session exits 254 immediately. */
 	breakSessions?: boolean;
-}): Promise<{ close: () => void; dropConnections: () => void }> {
+	/** Reject additional authenticated transports, like constrained shared hosting. */
+	maxConnections?: () => number;
+}): Promise<{ close: () => void; dropConnections: () => void; connectionCount: () => number }> {
 	const clients = new Set<import("ssh2").Connection>();
+	const authenticated = new Set<import("ssh2").Connection>();
+	let connectionCount = 0;
 	const server = new Server({ hostKeys: [fs.readFileSync(options.hostKeyPath)] }, (client) => {
 		client.on("error", () => {});
 		client.on("authentication", (ctx) => {
+			if (authenticated.size >= (options.maxConnections?.() ?? Infinity)) { ctx.reject(); return; }
 			if (ctx.method === "password" && ctx.username === "test" && ctx.password === "testpass") ctx.accept();
 			else if (ctx.method === "none") ctx.reject(["password"]);
 			else ctx.reject(["password"]);
 		});
 		client.on("ready", () => {
+			authenticated.add(client);
+			client.once("close", () => authenticated.delete(client));
 			client.on("session", (acceptSession) => {
 				const session = acceptSession();
 				session.on("exec", (acceptExec, _reject, info) => {
@@ -155,12 +162,14 @@ export function startServer(options: {
 	});
 	server.on("connection", (client) => {
 		clients.add(client);
+		connectionCount++;
 		client.on("close", () => clients.delete(client));
 	});
 	return new Promise((resolve) => {
 		server.listen(options.port, "127.0.0.1", () => {
 			resolve({
 				close: () => server.close(),
+				connectionCount: () => connectionCount,
 				dropConnections: () => {
 					for (const client of clients) client.end();
 				},

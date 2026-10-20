@@ -58,6 +58,7 @@ function shellRemote() {
 
 function harness(remote: RemoteConnection, options: {
 	initial?: string;
+	home?: string;
 	mode?: string;
 	hasUI?: boolean;
 	input?: string;
@@ -84,7 +85,7 @@ function harness(remote: RemoteConnection, options: {
 		},
 	};
 	const ctx = { hasUI: options.hasUI ?? true, mode: options.mode, ui, signal: options.signal } as unknown as ExtensionContext;
-	const result = chooseRemotePath(ctx, remote, options.initial);
+	const result = chooseRemotePath(ctx, remote, options.initial, options.home);
 	return {
 		result,
 		screen: () => { assert.ok(screen); return screen; },
@@ -135,6 +136,36 @@ test("unresolved home hints load in the background without SFTP preflight", asyn
 		h.key("\t");
 		h.key("\r");
 		assert.equal(await h.result, "./single dir/");
+	} finally { h.key("\x1b"); }
+});
+
+test("shared transport hints remain anchored at home without changing the active CWD", async () => {
+	const { remote } = shellRemote();
+	const cwd = path.join(home, "nested");
+	remote.remoteCwd = cwd;
+	const h = harness(remote, { mode: "tui", home: ".", initial: "sing" });
+	try {
+		await ready(h);
+		assert.match(h.text(), /single dir\//);
+		h.key("\t");
+		h.key("\r");
+		assert.equal(await h.result, "./single dir/");
+		assert.equal(remote.remoteCwd, cwd);
+	} finally { h.key("\x1b"); }
+});
+
+test("hint failures expose the underlying SSH error without terminal control characters", async () => {
+	const remote = { remoteCwd: ".", execChannel: async () => { throw new Error("SSH authentication refused: too many connections\x1b[31m"); } } as unknown as RemoteConnection;
+	const h = harness(remote, { mode: "tui" });
+	try {
+		await ready(h);
+		assert.match(h.text(), /Cannot fetch directories.*authentication refused.*too many connections/);
+		// Input cursor markers and the renderer's reset are legitimate. The
+		// injected red-color escape from the remote error must not survive.
+		assert.doesNotMatch(h.text(), /\x1b\[31m/);
+		h.key("/typed/path");
+		h.key("\r");
+		assert.equal(await h.result, "/typed/path");
 	} finally { h.key("\x1b"); }
 });
 

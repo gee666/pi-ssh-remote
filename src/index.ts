@@ -8,6 +8,7 @@
  * sshd with the SFTP subsystem and a POSIX shell is enough.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type { BashOperations, ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
@@ -92,7 +93,12 @@ function failClosedBashOps(message: string): BashOperations {
 	};
 }
 
-async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext, interactive = false): Promise<RemoteProject> {
+function canReuse(remote: RemoteConnection | null | undefined, project: RemoteProject): remote is RemoteConnection {
+	return !!remote && !remote.pathProblem && remote.projectRef.serverName === project.serverName &&
+		isDeepStrictEqual({ ...remote.projectRef.server, projects: undefined }, { ...project.server, projects: undefined });
+}
+
+async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext, interactive = false, active?: RemoteConnection | null): Promise<RemoteProject> {
 	const projects = await loadProjects();
 	if (projects.length === 0) {
 		throw new Error(`SSH remote settings were not found. Add at least one server to ${CONFIG_PATH}.`);
@@ -129,21 +135,21 @@ async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext, interactiv
 	if (index >= 0) return choices[index];
 	const home = { ...choices[0], project: { title: "Home", path: "." }, label: `${server}: home directory` };
 	if (choice === "Use home directory") return home;
-	return enterPath(ctx, home);
+	return enterPath(ctx, home, "", active);
 }
 
-async function enterPath(ctx: ExtensionContext, project: RemoteProject, initial = ""): Promise<RemoteProject> {
-	const probe = new RemoteConnection({ ...project, project: { title: "Home", path: "." } });
+async function enterPath(ctx: ExtensionContext, project: RemoteProject, initial = "", active?: RemoteConnection | null): Promise<RemoteProject> {
+	const shared = canReuse(active, project);
+	const probe = shared ? active : new RemoteConnection({ ...project, project: { title: "Home", path: "." } });
 	try {
 		// Render the picker before opening SSH/SFTP. Its hints connect in the
 		// background; only submission waits for directory validation.
 		let prefill = initial;
 		for (;;) {
-			const entered = await chooseRemotePath(ctx, probe, prefill);
+			const entered = await chooseRemotePath(ctx, probe, prefill, ".");
 			if (entered === undefined) throw new Error("SSH selection cancelled.");
-			probe.projectRef.project.path = entered || ".";
 			try {
-				const remotePath = await new RemoteFsRouter(probe).resolveProjectCwd();
+				const remotePath = await new RemoteFsRouter(probe).resolveDirectory(entered || ".");
 				return { ...project, project: { title: remotePath, path: remotePath }, label: `${project.serverName}: ${remotePath}` };
 			} catch (error) {
 				if (!isFriendly(error) || error.kind !== "remote-path") throw error;
@@ -152,7 +158,7 @@ async function enterPath(ctx: ExtensionContext, project: RemoteProject, initial 
 			}
 		}
 	} finally {
-		probe.dispose();
+		if (!shared) probe.dispose();
 	}
 }
 
@@ -189,11 +195,14 @@ export default function piSshRemote(pi: ExtensionAPI) {
 
 	async function activate(ctx: ExtensionContext, selected: RemoteProject, startup = false) {
 		const previous = connection;
+		const previousStateHandler = previous?.onStateChange;
 		let candidate: RemoteConnection | null = null;
 		try {
 			const project = selected;
-			const remote = new RemoteConnection(project);
-			candidate = remote;
+			const reused = canReuse(previous, project);
+			const remote = reused ? previous : new RemoteConnection(project);
+			if (!reused) candidate = remote;
+			let cwd = remote.remoteCwd;
 			const remoteFs = new RemoteFsRouter(remote);
 			remoteFs.onFallback = (reason) => {
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote: ${reason}`, "warning");
@@ -228,7 +237,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			// Connect once at startup to verify access and resolve the project
 			// path (it may be relative to the remote home directory).
 			try {
-				await remoteFs.resolveProjectCwd();
+				cwd = reused ? await remoteFs.resolveDirectory(project.project.path) : await remoteFs.resolveProjectCwd();
 			} catch (error) {
 				const friendly = isFriendly(error) ? error : new FriendlySshError(error instanceof Error ? error.message : String(error), "unknown", false);
 				// Setup problems (bad auth, bad key, missing path, host-key
@@ -251,20 +260,20 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			}
 
 			if (!startupWarning) {
-				try { await saveProjectPath(project.serverName, remote.remoteCwd); }
+				try { await saveProjectPath(project.serverName, cwd); }
 				catch (error) { ctx.ui.notify(`SSH connected, but could not save directory: ${String(error)}`, "warning"); }
 			}
 			const withSearch = searchEnabled || mode !== "ssh" || !startup;
 			const remoteTools: ToolDefinition[] = [
-				withLocalSkillReads(createReadTool(remote.remoteCwd, { operations: createRemoteReadOps(remoteFs) }), localCwd, getSkillPaths),
-				createWriteTool(remote.remoteCwd, { operations: createRemoteWriteOps(remoteFs) }),
-				createEditTool(remote.remoteCwd, { operations: createRemoteEditOps(remoteFs) }),
-				createBashTool(remote.remoteCwd, { operations: createRemoteBashOps(remote, localCwd) }),
+				withLocalSkillReads(createReadTool(cwd, { operations: createRemoteReadOps(remoteFs) }), localCwd, getSkillPaths),
+				createWriteTool(cwd, { operations: createRemoteWriteOps(remoteFs) }),
+				createEditTool(cwd, { operations: createRemoteEditOps(remoteFs) }),
+				createBashTool(cwd, { operations: createRemoteBashOps(remote, localCwd) }),
 				...(withSearch ? createRemoteSearchTools(remote, localCwd) : []),
 			];
 			const nextTools = [
 				...(mode === "ssh" ? [] : localTools(localCwd).map((tool) => namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`))),
-				...remoteTools.map((tool) => namedTool(tool, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${remote.remoteCwd}.`)),
+				...remoteTools.map((tool) => namedTool(tool, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${cwd}.`)),
 			];
 			const activeBefore = pi.getActiveTools();
 			try {
@@ -276,8 +285,10 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			}
 			installedTools = nextTools;
 			searchEnabled = withSearch;
+			Object.assign(remote.projectRef, project);
+			remote.remoteCwd = cwd;
 			connection = remote;
-			previous?.dispose();
+			if (previous !== remote) previous?.dispose();
 			fatalStartupError = null;
 			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject({ ...project, project: { ...project.project, path: remote.remoteCwd } });
 
@@ -289,6 +300,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			candidate?.dispose();
+			if (previous) previous.onStateChange = previousStateHandler;
 			if (!startup) throw error;
 			fatalStartupError = message;
 			connection = null;
@@ -341,8 +353,8 @@ export default function piSshRemote(pi: ExtensionAPI) {
 				try {
 					if (command !== "ssh" && !connection) throw new Error("Connect using /ssh first.");
 					let project: RemoteProject;
-					if (command === "ssh") project = await selectProject(pi, ctx, true);
-					else if (command === "ssh:cwd") project = await enterPath(ctx, connection!.projectRef, connection!.remoteCwd + "/");
+					if (command === "ssh") project = await selectProject(pi, ctx, true, connection);
+					else if (command === "ssh:cwd") project = await enterPath(ctx, connection!.projectRef, connection!.remoteCwd + "/", connection);
 					else {
 						mode = command === "ssh:include-local" ? "ssh-local" : "ssh";
 						project = { ...connection!.projectRef, project: { ...connection!.projectRef.project, path: connection!.remoteCwd } };

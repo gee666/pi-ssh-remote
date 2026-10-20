@@ -22,7 +22,12 @@ function chosenPath(value: string, home: string): string {
 }
 
 /** List only directories, including directory symlinks. No parsing of ls output. */
-async function directoryHints(remote: RemoteConnection, value: string, signal: AbortSignal): Promise<string[]> {
+function errorHint(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 500);
+}
+
+async function directoryHints(remote: RemoteConnection, value: string, signal: AbortSignal, home: string): Promise<string[]> {
 	const path = value === "~" ? "~/" : value;
 	const slash = path.lastIndexOf("/");
 	const parent = slash < 0 ? "." : path.slice(0, slash + 1);
@@ -30,7 +35,7 @@ async function directoryHints(remote: RemoteConnection, value: string, signal: A
 	const base = slash < 0 ? "" : parent;
 	const script = [
 		'cd -- "$HOME" 2>/dev/null || exit 1',
-		`p=${shellQuote(chosenPath(parent, remote.remoteCwd))}`,
+		`p=${shellQuote(chosenPath(parent, home))}`,
 		'CDPATH= cd -- "$p" 2>/dev/null || exit 1',
 		`prefix=${shellQuote(prefix)}`,
 		'for d in ./* ./.[!.]* ./..?*; do',
@@ -45,6 +50,7 @@ async function directoryHints(remote: RemoteConnection, value: string, signal: A
 		let settled = false;
 		let size = 0;
 		const chunks: Buffer[] = [];
+		let stderr = "";
 		const finish = (error?: Error) => {
 			if (settled) return;
 			settled = true;
@@ -63,7 +69,7 @@ async function directoryHints(remote: RemoteConnection, value: string, signal: A
 		// execChannel cannot abort connection establishment. Close a late channel too.
 		remote.execChannel(`bash -c ${shellQuote(script)}`).then((stream) => {
 			channel = stream;
-			stream.on("error", () => finish(new Error("Directory listing failed.")));
+			stream.on("error", (error: unknown) => finish(new Error(`Directory listing failed: ${errorHint(error)}`)));
 			if (settled) {
 				try { stream.close(); } catch { /* Already closed. */ }
 				return;
@@ -75,13 +81,12 @@ async function directoryHints(remote: RemoteConnection, value: string, signal: A
 				if (size > MAX_OUTPUT_BYTES) finish(new Error("Directory listing is too large. Type a longer prefix."));
 				else chunks.push(chunk);
 			});
-			// Drain stderr without displaying untrusted terminal escape sequences.
-			stream.stderr.on("data", () => {});
+			stream.stderr.on("data", (data: Buffer | string) => { stderr = (stderr + data.toString()).slice(-4096); });
 			stream.on("close", (code: number | undefined) => {
-				finish(code === 0 ? undefined : new Error("Cannot list this directory. Check the path and permissions."));
+				finish(code === 0 ? undefined : new Error(`Cannot list this directory. ${stderr.trim() ? errorHint(stderr.trim()) : code === undefined ? "SSH channel closed without an exit status." : `Remote command exited with code ${code}. Check the path and permissions.`}`));
 			});
 			stream.end();
-		}).catch(() => finish(new Error("Cannot fetch directories from the remote host.")));
+		}).catch((error: unknown) => finish(new Error(`Cannot fetch directories from the remote host: ${errorHint(error)}`)));
 	});
 
 	return output.toString("utf8").split("\0")
@@ -92,7 +97,8 @@ async function directoryHints(remote: RemoteConnection, value: string, signal: A
 
 /**
  * Prompt for a remote directory. Escape/cancellation or a mode without UI returns undefined.
- * Pass a home probe connection, with remoteCwd set to '.' or the resolved absolute home.
+ * Pass a home probe, or a shared connection with the home argument explicitly set to '.'.
+ * Never change the active connection's remoteCwd just to list hints.
  * Empty input, "." and "~" return that home; "~/foo" and "foo" return home + "/foo".
  * With an unresolved probe, returned relative paths are validated against home by the caller.
  * Absolute input is unchanged. Spaces and symlink/.. segments are preserved.
@@ -103,9 +109,9 @@ export async function chooseRemotePath(
 	ctx: ExtensionContext,
 	remote: RemoteConnection,
 	initial = "",
+	home = remote.remoteCwd,
 ): Promise<string | undefined> {
 	if (!ctx.hasUI || ctx.signal?.aborted) return undefined;
-	const home = remote.remoteCwd;
 	if (home !== "." && !home.startsWith("/")) throw new Error("The remote path picker requires a home probe connection.");
 	chosenPath(initial, home); // Reject unsafe terminal content before rendering a prefill.
 	// The optional property also supports older Pi types that predate ctx.mode.
@@ -185,7 +191,7 @@ export async function chooseRemotePath(
 				timer = setTimeout(() => {
 					const controller = new AbortController();
 					request = controller;
-					void directoryHints(remote, value, controller.signal).then((items) => {
+					void directoryHints(remote, value, controller.signal, home).then((items) => {
 						if (disposed || current !== generation) return;
 						candidates = items;
 						status = items.length ? "" : "No matching directories.";
