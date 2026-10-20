@@ -26,10 +26,13 @@ import {
 	matchInheritedProject,
 	matchProject,
 	saveProjectPath,
+	mergeImportedConnections,
 	type RemoteProject,
 } from "./config.ts";
 import { RemoteConnection } from "./connection.ts";
 import { chooseRemotePath } from "./path-picker.ts";
+import { discoverPuttySessions } from "./putty.ts";
+import { choosePuttyConnections } from "./putty-import.ts";
 import { RemoteFsRouter } from "./remote-fs.ts";
 import { withLocalSkillReads } from "./skill-read.ts";
 import { createRemoteSearchTools } from "./search-tools.ts";
@@ -132,7 +135,8 @@ async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext, interactiv
 async function enterPath(ctx: ExtensionContext, project: RemoteProject, initial = ""): Promise<RemoteProject> {
 	const probe = new RemoteConnection({ ...project, project: { title: "Home", path: "." } });
 	try {
-		await new RemoteFsRouter(probe).resolveProjectCwd();
+		// Render the picker before opening SSH/SFTP. Its hints connect in the
+		// background; only submission waits for directory validation.
 		let prefill = initial;
 		for (;;) {
 			const entered = await chooseRemotePath(ctx, probe, prefill);
@@ -355,6 +359,29 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			},
 		});
 	}
+
+	pi.registerCommand("ssh:import-putty", {
+		description: "Import selected or all PuTTY connections, optionally from a .reg file or sessions directory",
+		handler: async (args, ctx) => {
+			await ctx.waitForIdle();
+			try {
+				if (!ctx.hasUI) throw new Error("PuTTY import requires an interactive session.");
+				const source = args.trim().replace(/^([\"'])(.*)\1$/, "$2");
+				const result = await discoverPuttySessions(source || undefined);
+				for (const warning of result.warnings) ctx.ui.notify(warning, "warning");
+				if (!Object.keys(result.connections).length) {
+					ctx.ui.notify("No saved PuTTY SSH connections found. You can specify a .reg export or PuTTY sessions directory: /ssh:import-putty <path>", "info");
+					return;
+				}
+				const selected = await choosePuttyConnections(ctx, result.connections);
+				if (!selected) return;
+				const summary = await mergeImportedConnections(selected);
+				ctx.ui.notify(`PuTTY import: ${summary.added} added, ${summary.updated} updated, ${summary.unchanged} unchanged. Saved remote paths are preserved. Use /ssh to connect.`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
 
 	for (const local of [false, true]) {
 		pi.registerCommand(local ? "ssh:bash-local" : "ssh:bash", {

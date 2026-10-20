@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { open, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -157,12 +157,36 @@ export async function loadProjects(): Promise<RemoteProject[]> {
 	return projects;
 }
 
-// Serialize saves in this process so simultaneous selections do not lose paths.
+// Project saves and imports share a queue so neither can overwrite the other.
 let pendingSave: Promise<void> = Promise.resolve();
+
+function serializeSave<T>(operation: () => Promise<T>): Promise<T> {
+	const save = pendingSave.then(operation);
+	pendingSave = save.then(() => {}, () => {});
+	return save;
+}
+
+async function writeConfigAtomically(config: ConfigFile): Promise<void> {
+	await mkdir(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
+	// An exclusive, private sibling allows atomic replacement on the same filesystem.
+	const temporaryPath = `${CONFIG_PATH}.${randomUUID()}.tmp`;
+	const file = await open(temporaryPath, "wx", 0o600);
+	try {
+		try {
+			await file.writeFile(`${JSON.stringify(config, null, "\t")}\n`, "utf8");
+			await file.sync();
+		} finally {
+			await file.close();
+		}
+		await rename(temporaryPath, CONFIG_PATH);
+	} finally {
+		await rm(temporaryPath, { force: true });
+	}
+}
 
 /** Append a path without rewriting authentication or other server settings. */
 export function saveProjectPath(serverName: string, projectPath: string): Promise<void> {
-	const save = pendingSave.then(async () => {
+	return serializeSave(async () => {
 		if (typeof projectPath !== "string" || !projectPath.trim()) {
 			throw new Error("SSH remote project path must be a non-empty string.");
 		}
@@ -176,23 +200,69 @@ export function saveProjectPath(serverName: string, projectPath: string): Promis
 			path: projectPath,
 		}];
 
-		// Use an exclusive, private file beside the destination for atomic rename.
-		const temporaryPath = `${CONFIG_PATH}.${randomUUID()}.tmp`;
-		const file = await open(temporaryPath, "wx", 0o600);
-		try {
-			try {
-				await file.writeFile(`${JSON.stringify(config, null, "\t")}\n`, "utf8");
-				await file.sync();
-			} finally {
-				await file.close();
-			}
-			await rename(temporaryPath, CONFIG_PATH);
-		} finally {
-			await rm(temporaryPath, { force: true });
-		}
+		await writeConfigAtomically(config);
 	});
-	pendingSave = save.catch(() => {});
-	return save;
+}
+
+export type ImportSummary = { added: number; updated: number; unchanged: number };
+
+const IMPORTED_FIELDS = [
+	["host", "Host", "hostName", "HostName"],
+	["user", "User"],
+	["port", "Port"],
+	["identityFile", "IdentityFile"],
+] as const;
+
+/** Merge by exact server name. Only connection fields are imported.
+ * An omitted user clears both username aliases to restore PuTTY's default login.
+ * Omitted identities retain saved values, including manual OpenSSH conversions.
+ * Existing field spelling, projects, credentials, and unknown settings are preserved.
+ * Numeric and string ports compare equally. No write occurs for a no-op import.
+ */
+export function mergeImportedConnections(connections: Record<string, ServerConfig>): Promise<ImportSummary> {
+	return serializeSave(async () => {
+		const imported = validateConfig(connections);
+		let config: ConfigFile;
+		try {
+			config = parseConfig(await readFile(CONFIG_PATH, "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			config = Object.create(null);
+		}
+		const summary: ImportSummary = { added: 0, updated: 0, unchanged: 0 };
+		for (const [name, incoming] of Object.entries(imported)) {
+			const exists = Object.hasOwn(config, name);
+			const server = exists ? config[name] : {};
+			let changed = false;
+			if (incoming.user === undefined && incoming.User === undefined) {
+				for (const field of ["user", "User"] as const) {
+					if (Object.hasOwn(server, field)) {
+						delete server[field];
+						changed = true;
+					}
+				}
+			}
+			for (const aliases of IMPORTED_FIELDS) {
+				const sourceField = aliases.find((field) => incoming[field] !== undefined);
+				if (!sourceField) continue;
+				const targetField = aliases.find((field) => server[field] !== undefined) ?? aliases[0];
+				const value = incoming[sourceField];
+				const current = server[targetField];
+				if (current === value || (aliases[0] === "port" && current !== undefined && Number(current) === Number(value))) continue;
+				// Both fields belong to the same alias group. Assignment through a
+				// record avoids the intersection of string and port field types.
+				(server as Record<string, unknown>)[targetField] = value;
+				changed = true;
+			}
+			if (!exists) {
+				config[name] = server;
+				summary.added++;
+			} else if (changed) summary.updated++;
+			else summary.unchanged++;
+		}
+		if (summary.added || summary.updated) await writeConfigAtomically(config);
+		return summary;
+	});
 }
 
 function matchExactProject(projects: RemoteProject[], serverName: string, projectPath: string): RemoteProject | undefined {

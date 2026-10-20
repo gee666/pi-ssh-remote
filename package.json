@@ -1,6 +1,6 @@
 {
   "name": "oira666_pi-ssh-remote",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Pi extension that transparently runs core tools on a selected SSH remote project.",
   "type": "module",
   "main": "./src/index.ts",
@@ -35,6 +35,6 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test test/test-skill-read.ts test/test-search-tools.ts test/test-modes.ts test/test-config.ts test/test-path-picker.ts && node --experimental-strip-types test/test-integration.ts"
+    "test": "node --experimental-strip-types --test test/test-skill-read.ts test/test-search-tools.ts test/test-modes.ts test/test-config.ts test/test-path-picker.ts test/test-putty.ts test/test-putty-import.ts && node --experimental-strip-types test/test-integration.ts"
   }
 }

@@ -109,6 +109,35 @@ async function ready(h: ReturnType<typeof harness>) {
 	await waitFor(() => !h.text().includes("Loading directories..."));
 }
 
+test("unconnected home probe opens immediately and accepts input while SSH is pending", async () => {
+	let requested = false;
+	const remote = {
+		remoteCwd: ".",
+		execChannel: () => { requested = true; return new Promise(() => {}); },
+	} as unknown as RemoteConnection;
+	const h = harness(remote, { mode: "tui" });
+	assert.equal(h.customs(), 1);
+	assert.match(h.text(), /Loading directories/);
+	await waitFor(() => requested);
+	h.key("new folder");
+	h.key("\r");
+	assert.equal(await h.result, "./new folder");
+});
+
+test("unresolved home hints load in the background without SFTP preflight", async () => {
+	const { remote } = shellRemote();
+	remote.remoteCwd = ".";
+	const h = harness(remote, { mode: "tui", initial: "sing" });
+	try {
+		assert.equal(h.customs(), 1);
+		await ready(h);
+		assert.match(h.text(), /single dir\//);
+		h.key("\t");
+		h.key("\r");
+		assert.equal(await h.result, "./single dir/");
+	} finally { h.key("\x1b"); }
+});
+
 test("RPC falls back to input, expands home, and never lists directories", async () => {
 	const { remote, channels } = shellRemote();
 	for (const [input, expected] of [["", home], ["~", home], ["~/nested", `${home}/nested`], ["relative space ", `${home}/relative space `], ["/absolute", "/absolute"], ["link/../x", `${home}/link/../x`]] as const) {

@@ -12,7 +12,7 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-/** Anchor at the probe's resolved home without collapsing symlink/.. segments. */
+/** Anchor at home without collapsing symlink/.. segments. '.' means unresolved home. */
 function chosenPath(value: string, home: string): string {
 	if (CONTROL.test(value)) throw new Error("Remote directory paths cannot contain control characters.");
 	if (value.startsWith("/")) return value;
@@ -92,8 +92,9 @@ async function directoryHints(remote: RemoteConnection, value: string, signal: A
 
 /**
  * Prompt for a remote directory. Escape/cancellation or a mode without UI returns undefined.
- * Pass a home-resolved probe connection: remote.remoteCwd must be the absolute home.
+ * Pass a home probe connection, with remoteCwd set to '.' or the resolved absolute home.
  * Empty input, "." and "~" return that home; "~/foo" and "foo" return home + "/foo".
+ * With an unresolved probe, returned relative paths are validated against home by the caller.
  * Absolute input is unchanged. Spaces and symlink/.. segments are preserved.
  * The caller validates the result. This picker does not resolve symlinks or check existence.
  * Hints contain directories only; names with terminal control characters are omitted.
@@ -105,7 +106,7 @@ export async function chooseRemotePath(
 ): Promise<string | undefined> {
 	if (!ctx.hasUI || ctx.signal?.aborted) return undefined;
 	const home = remote.remoteCwd;
-	if (!home.startsWith("/")) throw new Error("The remote path picker requires a home-resolved connection.");
+	if (home !== "." && !home.startsWith("/")) throw new Error("The remote path picker requires a home probe connection.");
 	chosenPath(initial, home); // Reject unsafe terminal content before rendering a prefill.
 	// The optional property also supports older Pi types that predate ctx.mode.
 	const mode = (ctx as ExtensionContext & { mode?: string }).mode;

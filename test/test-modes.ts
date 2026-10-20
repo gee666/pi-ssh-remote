@@ -198,6 +198,47 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.ok(JSON.parse(await readFile(CONFIG_PATH, "utf8")).test.projects.some((p: { path: string }) => p.path === remoteDir));
 			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
 		});
+		await t.test("new-path and CWD inputs appear before any SSH directory resolution", async (t) => {
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				let resolves = 0;
+				let inputs = 0;
+				t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async () => { resolves++; throw new Error("must not wait for SSH before input"); });
+				h.ctx.ui.input = async () => { inputs++; assert.equal(resolves, 0); return undefined; };
+				h.selections.push("test", "Enter a new path");
+				await h.command("ssh");
+				await h.command("ssh:cwd");
+				assert.equal(inputs, 2);
+				assert.equal(resolves, 0);
+			} finally { await h.stop(); }
+		});
+		await t.test("PuTTY import command updates by name, preserves paths, and does not activate SSH", async () => {
+			const original = await readFile(CONFIG_PATH, "utf8");
+			const source = path.join(root, "putty sessions");
+			await mkdir(source);
+			await writeFile(path.join(source, "test"), "HostName=changed.example\nUserName=deploy\nPortNumber=2222\nProtocol=ssh\n");
+			await writeFile(path.join(source, "Imported%20new"), "HostName=new.example\nProtocol=ssh\n");
+			const h = harness([]);
+			try {
+				await h.start();
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.selections.push("Import all (2)");
+				await h.command("ssh:import-putty", `"${source}"`);
+				const config = JSON.parse(await readFile(CONFIG_PATH, "utf8"));
+				assert.deepEqual(Object.keys(config).sort(), ["Imported new", "test"]);
+				assert.deepEqual(config.test.projects, JSON.parse(original).test.projects);
+				assert.equal(config.test.hostName ?? config.test.host, "changed.example");
+				assert.equal(config.test.port, 2222);
+				assert.ok(h.notifications.some((message) => message.includes("1 added, 1 updated")));
+				h.selections.push("Import all (2)");
+				await h.command("ssh:import-putty", source);
+				assert.ok(h.notifications.some((message) => message.includes("0 added, 0 updated, 2 unchanged")));
+				assert.equal(h.tools.size, 0);
+				assert.equal(h.prompt(), undefined);
+			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
+		});
 		await t.test("local-first include and exclude retire stale aliases without hiding unrelated tools", async () => {
 			const h = harness(["ssh-local-first"]);
 			try {

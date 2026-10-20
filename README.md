@@ -28,7 +28,7 @@ pi --ssh
 
 First choose a connection, then choose one of its saved remote directories, enter a new path, or use the remote home directory. A connection can have no `projects` at all. In that case pi connects and offers a path input. Leave it empty to use home.
 
-The terminal path input supports Tab completion and shows directories only, including hidden directories. Paths with spaces are supported. Enter accepts a directory; Escape cancels. RPC clients use a plain path input instead. Successfully selected paths are saved under the connection's `projects` in `~/.pi/agent/ssh-remote-config.json` and offered next time. Existing titles and connection settings are preserved.
+The path input opens immediately, before connecting or resolving remote directories. Directory hints load in the background, so you can type or cancel while SSH is still connecting. The terminal path input supports Tab completion and shows directories only, including hidden directories. Paths with spaces are supported. Enter accepts a directory; Escape cancels. RPC clients use a plain path input instead. Successfully selected paths are saved under the connection's `projects` in `~/.pi/agent/ssh-remote-config.json` and offered next time. Existing titles and connection settings are preserved.
 
 ### Session commands
 
@@ -40,8 +40,24 @@ The terminal path input supports Tab completion and shows directories only, incl
 | `/ssh:exclude-local` | Disable local tool access and use remote tools by default |
 | `/ssh:bash <command>` | Run a remote bash command and add its output to the conversation |
 | `/ssh:bash-local <command>` | Run a local bash command and add its output to the conversation |
+| `/ssh:import-putty [path]` | Import all or selected PuTTY SSH connections |
 
 Switches wait for the current agent run to finish. They keep the conversation and add a message telling the model which server and directory are now active. A failed or cancelled switch keeps the previous connection. Bash commands have a 60-second timeout and use the normal bash tool's output limits. `/ssh:bash-local` is an explicit local command and works even when local model tools are disabled.
+
+### Importing PuTTY connections
+
+Run `/ssh:import-putty` to find saved PuTTY sessions, then choose **Import all** or **Choose connections**. On Windows it reads the current user's PuTTY registry sessions. On Linux and macOS it reads `~/.putty/sessions`; on WSL it also tries the Windows registry when that directory is absent. In the individual picker, toggle connection names and select **Import selected** to save. Escape cancels without changing the config.
+
+You can also specify a Windows registry export or a PuTTY sessions directory:
+
+```text
+/ssh:import-putty /path/to/putty-sessions.reg
+/ssh:import-putty /path/to/.putty/sessions
+```
+
+Connections are matched by their exact saved session name. Reimporting updates changed connection settings, adds new names, and leaves unchanged entries alone. Saved remote paths and manually configured credentials are preserved. A missing PuTTY username clears the saved username; an omitted or unsupported key leaves any manually configured OpenSSH identity unchanged. Importing does not switch an active SSH session; use `/ssh` afterward.
+
+PuTTY `.ppk` private keys must be converted to OpenSSH format with PuTTYgen before this extension can use them. The importer reports unsupported key settings rather than copying a key that SSH cannot read. Passwords are not imported.
 
 ### Mixed local and SSH access
 
