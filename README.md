@@ -44,7 +44,7 @@ The path input opens immediately, before connecting or resolving remote director
 
 Directory changes and path hints reuse the active SSH connection when the server settings are unchanged. They do not open extra logins on each change. Hint failures show the underlying SSH error, and you can still type a path or retry with Tab.
 
-Switches wait for the current agent run to finish. They keep the conversation and add a message telling the model which server and directory are now active. A failed or cancelled switch keeps the previous connection. Bash commands have a 60-second timeout and use the normal bash tool's output limits. `/ssh:bash-local` is an explicit local command and works even when local model tools are disabled.
+Switches wait for the current agent run to finish and keep the conversation. The first connection sends `SSH connected to: name, CWD: path` to the model. Actual server or directory changes send `SSH connection switched to: name, CWD: path`. Selecting the same location again sends nothing. `/ssh:include-local` and `/ssh:exclude-local` show local-access status in the UI without sending connection-change messages. A failed or cancelled switch keeps the previous connection. Bash commands have a 60-second timeout and use the normal bash tool's output limits. `/ssh:bash-local` is an explicit local command and works even when local model tools are disabled.
 
 ### Importing PuTTY connections
 

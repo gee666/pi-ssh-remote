@@ -108,6 +108,8 @@ test("startup modes and explicit opt-in", async (t) => {
 						assert.match(h.prompt(), mode === "ssh-local" ? /read-local/ : /read-ssh/);
 					}
 					assert.equal(h.bash() === undefined, mode === "ssh-local-first");
+					assert.equal(h.messages.length, 1);
+					assert.equal(h.messages[0].content, `SSH connected to: test, CWD: ${remoteDir}`);
 					assert.ok(h.prompt().includes(`Current working directory: ${mode === "ssh-local-first" ? process.cwd() : remoteDir}`));
 				} finally { await h.stop(); }
 			});
@@ -132,17 +134,68 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.equal(h.tools.size, 0);
 				await h.command("ssh");
 				assert.match(await h.run("bash", { command: "pwd" }), new RegExp(remoteDir));
-				assert.match(h.messages.at(-1)!.content, /context is unchanged/);
+				assert.equal(h.messages.at(-1)!.content, `SSH connected to: test, CWD: ${remoteDir}`);
+				const connectedMessages = [...h.messages];
 				await h.command("ssh:include-local");
+				await h.command("ssh:include-local");
+				assert.deepEqual(h.messages, connectedMessages);
+				assert.ok(h.notifications.some((message) => message.startsWith("Local tools ending in -local enabled")));
 				assert.ok(h.active().includes("bash-local"));
 				assert.match(await h.run("bash-local", { command: "pwd" }), new RegExp(process.cwd()));
 				await h.command("ssh:bash", "printf REMOTE_COMMAND");
 				assert.match(h.messages.at(-1)!.content, /REMOTE_COMMAND/);
 				await h.command("ssh:bash-local", "printf LOCAL_COMMAND");
 				assert.match(h.messages.at(-1)!.content, /LOCAL_COMMAND/);
+				const beforeExclude = [...h.messages];
+				await h.command("ssh:exclude-local");
 				await h.command("ssh:exclude-local");
 				assert.ok(!h.active().some((name) => name.endsWith("-local")));
-				assert.match(h.messages.at(-1)!.content, /local tools are disabled/);
+				assert.deepEqual(h.messages, beforeExclude);
+				assert.ok(h.notifications.includes("Local tools disabled."));
+			} finally { await h.stop(); }
+		});
+		await t.test("same-location selections are silent and CWD changes send facts only", async () => {
+			const original = await readFile(CONFIG_PATH, "utf8");
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				const first = [...h.messages];
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.selections.push("test", `1. test (${remoteDir})`);
+				await h.command("ssh");
+				h.inputs.push(remoteDir);
+				await h.command("ssh:cwd");
+				assert.deepEqual(h.messages, first);
+				const next = path.join(remoteDir, "message-cwd");
+				await mkdir(next);
+				h.inputs.push(next);
+				await h.command("ssh:cwd");
+				assert.equal(h.messages.length, 2);
+				assert.equal(h.messages[1].content, `SSH connection switched to: test, CWD: ${next}`);
+				h.inputs.push(next);
+				await h.command("ssh:cwd");
+				assert.equal(h.messages.length, 2);
+				assert.ok(!h.notifications.some((message) => message.startsWith("SSH remote connected:")));
+			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
+		});
+		await t.test("first connection after offline startup is announced after path validation", async (t) => {
+			const h = harness(["ssh"]);
+			const resolve = RemoteFsRouter.prototype.resolveProjectCwd;
+			let first = true;
+			t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async function (this: InstanceType<typeof RemoteFsRouter>) {
+				if (first) { first = false; throw new FriendlySshError("Simulated offline startup", "connection", true); }
+				return resolve.call(this);
+			});
+			try {
+				await h.start();
+				assert.equal(h.messages.length, 0);
+				await h.run("bash", { command: "printf connected" });
+				const deadline = Date.now() + 2000;
+				while (h.messages.length === 0 && Date.now() < deadline) await new Promise((done) => setTimeout(done, 10));
+				assert.equal(h.messages.length, 1);
+				assert.equal(h.messages[0].content, `SSH connected to: test, CWD: ${remoteDir}`);
+				await h.run("bash", { command: "printf again" });
+				assert.equal(h.messages.length, 1);
 			} finally { await h.stop(); }
 		});
 		await t.test("switches server and CWD, and a failed switch leaves tools on the previous connection", async () => {
@@ -160,7 +213,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				await h.command("ssh");
 				assert.match(await h.run("read", { path: "next.txt" }), /NEXT_SERVER_CWD/);
 				assert.ok(h.prompt().includes(nextDir));
-				assert.match(h.messages.at(-1)!.content, /'second'/);
+				assert.equal(h.messages.at(-1)!.content, `SSH connection switched to: second, CWD: ${nextDir}`);
 				h.selections.push("second", `2. Missing (${path.join(root, "missing")})`);
 				await h.command("ssh");
 				assert.match(await h.run("read", { path: "next.txt" }), /NEXT_SERVER_CWD/);
@@ -262,7 +315,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				}) as typeof h.ctx.ui.custom;
 				h.selections.push("test", "Enter a new path");
 				await h.command("ssh");
-				assert.equal(h.messages.length, 4);
+				assert.equal(h.messages.length, 5);
 				assert.equal(server.connectionCount(), count, "directory changes must not open additional SSH transports");
 				assert.match(await h.run("read", { path: "fourth.txt" }), /FOURTH_DIRECTORY/);
 				assert.equal((await h.run("bash", { command: "pwd" })).trim(), next);
@@ -341,7 +394,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				h.selections.push("test", `1. test (${remoteDir})`);
 				await h.command("ssh");
 				assert.ok(h.notifications.includes("Injected temporary network failure"));
-				assert.equal(h.messages.length, 0, "a failed switch is not announced as successful");
+				assert.equal(h.messages.length, 1, "a failed switch is not announced as successful");
 				assert.deepEqual(h.active(), activeBefore);
 				for (const [name, tool] of toolsBefore) assert.equal(h.tools.get(name), tool);
 				assert.equal(process.env[INHERITED_PROJECT_ENV], inheritedBefore);
@@ -382,7 +435,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.equal(failed, true);
 				assert.deepEqual(attempted.slice(0, 3), ["read", "write", "edit"], "failure follows partial replacement");
 				assert.ok(h.notifications.includes("Injected registration failure"));
-				assert.equal(h.messages.length, 0);
+				assert.equal(h.messages.length, 1);
 				assert.deepEqual(h.active(), activeBefore);
 				for (const [name, tool] of toolsBefore) assert.equal(h.tools.get(name), tool);
 				assert.equal(process.env[INHERITED_PROJECT_ENV], inheritedBefore);
@@ -395,7 +448,7 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.match(await h.run("read", { path: "candidate.txt" }), /CANDIDATE_ONLY/);
 				assert.equal((await h.run("bash", { command: "pwd" })).trim(), nextDir);
 				assert.equal(process.env[INHERITED_PROJECT_ENV], `candidate::${nextDir}`);
-				assert.match(h.messages.at(-1)!.content, /'candidate'/);
+				assert.equal(h.messages.at(-1)!.content, `SSH connection switched to: candidate, CWD: ${nextDir}`);
 			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
 		});
 		for (const initialMode of ["ssh-local-first", "ssh-local"]) {
@@ -420,7 +473,7 @@ test("startup modes and explicit opt-in", async (t) => {
 					await h.command(command);
 					assert.equal(failed, true);
 					assert.ok(h.notifications.includes("Injected mode registration failure"));
-					assert.equal(h.messages.length, 0);
+					assert.equal(h.messages.length, 1);
 					assert.deepEqual(h.active(), activeBefore);
 					for (const [name, tool] of toolsBefore) assert.equal(h.tools.get(name), tool);
 					assert.equal(h.prompt(), promptBefore);

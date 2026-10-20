@@ -189,6 +189,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 	let startupWarning: string | null = null;
 	let searchEnabled = false;
 	let installedTools: ToolDefinition[] = [];
+	let announcedLocation: string | undefined;
 	const localCwd = process.cwd();
 	let skillPaths: string[] = [];
 	const getSkillPaths = () => skillPaths;
@@ -217,7 +218,11 @@ export default function piSshRemote(pi: ExtensionAPI) {
 					// an invalid path then fails all operations closed.
 					if (needsPathValidation) {
 						needsPathValidation = false;
-						remoteFs.resolveProjectCwd().catch((error: unknown) => {
+						remoteFs.resolveProjectCwd().then(() => {
+							if (connection !== remote) return;
+							startupWarning = null;
+							announceLocation(remote);
+						}).catch((error: unknown) => {
 							if (isFriendly(error) && error.kind === "remote-path") {
 								remote.pathProblem = error;
 								ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH path error: ${project.serverName}`));
@@ -295,7 +300,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			ctx.ui.setTitle(`SSH ${project.project.title}`);
 			if (!startupWarning) {
 				ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${project.serverName}:${remote.remoteCwd}`));
-				if (ctx.hasUI) ctx.ui.notify(`SSH remote connected: ${project.label}`, "info");
+				announceLocation(remote);
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -343,6 +348,14 @@ export default function piSshRemote(pi: ExtensionAPI) {
 		pi.sendMessage({ customType: "ssh-remote", content, display: true });
 	}
 
+	function announceLocation(remote: RemoteConnection) {
+		const location = JSON.stringify([remote.projectRef.serverName, remote.remoteCwd]);
+		if (location === announcedLocation) return;
+		const action = announcedLocation === undefined ? "SSH connected to" : "SSH connection switched to";
+		inform(`${action}: ${remote.projectRef.serverName}, CWD: ${remote.remoteCwd}`);
+		announcedLocation = location;
+	}
+
 	for (const command of ["ssh", "ssh:cwd", "ssh:include-local", "ssh:exclude-local"] as const) {
 		pi.registerCommand(command, {
 			description: command === "ssh" ? "Connect or switch SSH server and directory without clearing context" : command === "ssh:cwd" ? "Change remote directory with completion" : command === "ssh:include-local" ? "Enable local tools with -local suffix" : "Disable local tool access",
@@ -361,7 +374,9 @@ export default function piSshRemote(pi: ExtensionAPI) {
 					}
 					startupWarning = null;
 					await activate(ctx, project);
-					inform(`SSH connection switched to '${connection!.projectRef.serverName}', remote CWD ${connection!.remoteCwd}. Previous conversation context is unchanged. Do not assume files or shell state from the previous location still apply. ${mode === "ssh-local" ? `Local tools ending in -local are enabled in ${localCwd}.` : mode === "ssh-local-first" ? "Unsuffixed tools remain local; use -ssh tools remotely." : "Tools run remotely; local tools are disabled."}`);
+					if (command === "ssh:include-local" || command === "ssh:exclude-local") {
+						ctx.ui.notify(command === "ssh:include-local" ? `Local tools ending in -local enabled in ${localCwd}.` : "Local tools disabled.", "info");
+					}
 				} catch (error) {
 					mode = oldMode;
 					startupWarning = oldWarning;
