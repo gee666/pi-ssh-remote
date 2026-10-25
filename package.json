@@ -1,6 +1,6 @@
 {
   "name": "oira666_pi-ssh-remote",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "Pi extension that transparently runs core tools on a selected SSH remote project.",
   "type": "module",
   "main": "./src/index.ts",
@@ -28,13 +28,15 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.75.5",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-tui": "^1.4.0",
     "@types/node": "^24.0.0",
     "@types/ssh2": "^1.15.5",
     "typescript": "^5.9.3"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "pretest": "npm install --save-dev --ignore-scripts @earendil-works/pi-coding-agent@latest @earendil-works/pi-tui@latest && npm run typecheck",
     "test": "node --experimental-strip-types --test test/test-skill-read.ts test/test-search-tools.ts test/test-modes.ts test/test-config.ts test/test-path-picker.ts test/test-putty.ts test/test-putty-import.ts test/test-connection-lifecycle.ts && node --experimental-strip-types test/test-integration.ts"
   }
 }

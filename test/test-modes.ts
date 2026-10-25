@@ -57,7 +57,7 @@ function harness(flags: string[], inherited = false) {
 		setActiveTools(names: string[]) { active = names; },
 		on(name: string, handler: Function) { handlers.set(name, handler); },
 	} as unknown as ExtensionAPI;
-	const ctx = { hasUI: false, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus(...args: unknown[]) { statuses.push(args); }, setWidget(_key: string, factory: Function | undefined, options?: { placement: string }) { widget = factory?.({}, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }); widgetPlacement = options?.placement; }, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
+	const ctx = { hasUI: false, sessionManager: { getSessionId: () => "test-session", getSessionFile: () => undefined }, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus(...args: unknown[]) { statuses.push(args); }, setWidget(_key: string, factory: Function | undefined, options?: { placement: string }) { widget = factory?.({}, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }); widgetPlacement = options?.placement; }, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
 	extension(pi);
 	return {
 		pi, tools, registeredFlags, messages, notifications, selections, inputs, ctx, active: () => active,

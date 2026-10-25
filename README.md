@@ -176,9 +176,11 @@ A standard SSH server, plus `bash` for shell commands. The SFTP subsystem is use
 
 ```bash
 npm run typecheck   # strict TS, no emit
-npm test            # integration tests against an in-process ssh2 server
+npm test            # update Pi libraries, typecheck, then run all tests
 ```
+
+`npm test` first installs the npm `latest` releases of `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`. This requires npm registry access and can update `package.json` and `package-lock.json`. If the update or typecheck fails, tests do not run. Dependency lifecycle scripts are disabled during the update.
 
 Startup-mode tests verify tool names, activation, local/remote execution, inherited-project behavior, and fail-closed setup. Search-tool tests cover remote paths, quoting, output limits, cancellation, and diagnostics. Search tests use local `rg` and `fd` when available.
 
-The test suite (`test/test-integration.ts`) spins up a local SSH server (auth + SFTP + exec) and exercises connect, relative path resolution, file round-trips with awkward filenames, binary safety, exit codes, timeouts, aborts, parallel operations, automatic reconnection, and host-key pinning — no network or credentials required.
+The test suite (`test/test-integration.ts`) spins up a local SSH server (auth + SFTP + exec) and exercises connect, relative path resolution, file round-trips with awkward filenames, binary safety, exit codes, timeouts, aborts, parallel operations, automatic reconnection, and host-key pinning — no external SSH server or credentials required.
