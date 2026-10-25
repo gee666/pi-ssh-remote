@@ -178,10 +178,13 @@ A standard SSH server, plus `bash` for shell commands. The SFTP subsystem is use
 
 ```bash
 npm run typecheck   # strict TS, no emit
-npm test            # update Pi libraries, typecheck, then run all tests
+npm test            # update Pi libraries, typecheck, then run unit/SSH tests
+npm run test:evergreen # also run tool-workflow integration and installed-Pi e2e
 ```
 
 `npm test` first installs the npm `latest` releases of `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`. This requires npm registry access and can update `package.json` and `package-lock.json`. If the update or typecheck fails, tests do not run. Dependency lifecycle scripts are disabled during the update.
+
+Evergreen e2e requires `EVERGREEN_E2E_MODEL` (an authenticated `provider/model`, optionally with `:thinking`) and runs `EVERGREEN_PI_BIN`, falling back to `pi` on PATH. It starts a loopback SSH server and verifies model-issued remote read/write/edit/bash workflows without touching the local launch directory. Tests isolate config and copy only provider credentials/catalog from `PI_CODING_AGENT_DIR` or `~/.pi/agent`; sessions remain enabled and Pi stdin is ignored. See [EVERGREEN.md](EVERGREEN.md) for intent and coverage.
 
 Before every release, update the tested-against line at the top of this README to the actual Pi version that passed the checks, and keep the supported Pi peer ranges in `package.json` accurate. See the tracked root `AGENTS.md` for release instructions and the code quality bar.
 

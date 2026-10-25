@@ -37,6 +37,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "pretest": "npm install --save-dev --ignore-scripts @earendil-works/pi-coding-agent@latest @earendil-works/pi-tui@latest && npm run typecheck",
+    "test:evergreen": "npm test && node --experimental-strip-types --test test/test-tool-workflow.ts test/test-e2e.ts",
     "test": "node --experimental-strip-types --test test/test-skill-read.ts test/test-search-tools.ts test/test-modes.ts test/test-config.ts test/test-path-picker.ts test/test-putty.ts test/test-putty-import.ts test/test-connection-lifecycle.ts && node --experimental-strip-types test/test-integration.ts"
   }
 }

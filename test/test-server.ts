@@ -17,7 +17,7 @@ export function startServer(options: {
 	breakSessions?: boolean;
 	/** Reject additional authenticated transports, like constrained shared hosting. */
 	maxConnections?: () => number;
-}): Promise<{ close: () => void; dropConnections: () => void; connectionCount: () => number }> {
+}): Promise<{ port: number; close: () => void; dropConnections: () => void; connectionCount: () => number }> {
 	const clients = new Set<import("ssh2").Connection>();
 	const authenticated = new Set<import("ssh2").Connection>();
 	let connectionCount = 0;
@@ -167,7 +167,10 @@ export function startServer(options: {
 	});
 	return new Promise((resolve) => {
 		server.listen(options.port, "127.0.0.1", () => {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
 			resolve({
+				port: address.port,
 				close: () => server.close(),
 				connectionCount: () => connectionCount,
 				dropConnections: () => {

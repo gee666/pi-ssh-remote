@@ -311,7 +311,12 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			];
 			const nextTools = [
 				...(mode === "ssh" ? [] : localTools(localCwd).map((tool) => namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`))),
-				...remoteTools.map((tool) => namedTool(tool, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${cwd}.`)),
+				...remoteTools.map((tool) => namedTool({
+					...tool,
+					// Pi supplies the local session cwd at execution; remote factories
+					// must resolve relative paths against the selected SSH project.
+					execute: (id, params, signal, onUpdate, ctx) => tool.execute(id, params, signal, onUpdate, { ...ctx, cwd }),
+				} satisfies ToolDefinition, mode === "ssh-local-first" ? "-ssh" : "", `SSH server ${project.serverName}. Working directory: ${cwd}.`)),
 			];
 			const activeBefore = pi.getActiveTools();
 			try {

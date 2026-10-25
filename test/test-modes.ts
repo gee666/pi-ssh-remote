@@ -57,7 +57,7 @@ function harness(flags: string[], inherited = false) {
 		setActiveTools(names: string[]) { active = names; },
 		on(name: string, handler: Function) { handlers.set(name, handler); },
 	} as unknown as ExtensionAPI;
-	const ctx = { hasUI: false, sessionManager: { getSessionId: () => "test-session", getSessionFile: () => undefined }, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus(...args: unknown[]) { statuses.push(args); }, setWidget(_key: string, factory: Function | undefined, options?: { placement: string }) { widget = factory?.({}, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }); widgetPlacement = options?.placement; }, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
+	const ctx = { cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "test-session", getSessionFile: () => undefined }, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus(...args: unknown[]) { statuses.push(args); }, setWidget(_key: string, factory: Function | undefined, options?: { placement: string }) { widget = factory?.({}, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }); widgetPlacement = options?.placement; }, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
 	extension(pi);
 	return {
 		pi, tools, registeredFlags, messages, notifications, selections, inputs, ctx, active: () => active,
@@ -118,6 +118,20 @@ test("startup modes and explicit opt-in", async (t) => {
 				} finally { await h.stop(); }
 			});
 		}
+		await t.test("remote write and edit ignore the local session context cwd", async () => {
+			const h = harness(["ssh"]);
+			const file = "context-workflow.txt";
+			try {
+				await h.start();
+				assert.equal(h.ctx.cwd, process.cwd());
+				assert.notEqual(h.ctx.cwd, remoteDir);
+				await h.run("write", { path: file, content: "REMOTE DRAFT\n" });
+				assert.equal(await readFile(path.join(remoteDir, file), "utf8"), "REMOTE DRAFT\n");
+				await h.run("edit", { path: file, edits: [{ oldText: "DRAFT", newText: "READY" }] });
+				assert.equal(await readFile(path.join(remoteDir, file), "utf8"), "REMOTE READY\n");
+				assert.equal(await h.run("read", { path: file }), "REMOTE READY\n");
+			} finally { await h.stop(); }
+		});
 		await t.test("SSH widget is one dim line below the editor only while connected", async (t) => {
 			const h = harness(["ssh"]);
 			let remote!: InstanceType<typeof import("../src/connection.ts").RemoteConnection>;
