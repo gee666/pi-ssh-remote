@@ -1,5 +1,7 @@
 # pi ssh remote
 
+Tested against Pi 1.4.0
+
 `oira666_pi-ssh-remote` is a pi extension that makes the built-in `read`, `write`, `edit`, and `bash` tools operate on a remote SSH project instead of the local filesystem. The agent works as if it were running natively on the remote server. Available skills are the exception: `read` checks their advertised paths locally first, then falls back to SSH if the local file is absent. This also covers supporting files inside directory skills. Ordinary project reads, writes, edits, and shell commands remain remote.
 
 The extension starts locally unless pi starts with `--ssh`, `--ssh-local`, `--ssh-local-first`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT` set. Use `/ssh` at any time to connect or switch servers without clearing the conversation.
@@ -180,6 +182,8 @@ npm test            # update Pi libraries, typecheck, then run all tests
 ```
 
 `npm test` first installs the npm `latest` releases of `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`. This requires npm registry access and can update `package.json` and `package-lock.json`. If the update or typecheck fails, tests do not run. Dependency lifecycle scripts are disabled during the update.
+
+Before every release, update the tested-against line at the top of this README to the actual Pi version that passed the checks, and keep the supported Pi peer ranges in `package.json` accurate. See the tracked root `AGENTS.md` for release instructions and the code quality bar.
 
 Startup-mode tests verify tool names, activation, local/remote execution, inherited-project behavior, and fail-closed setup. Search-tool tests cover remote paths, quoting, output limits, cancellation, and diagnostics. Search tests use local `rg` and `fd` when available.
 
