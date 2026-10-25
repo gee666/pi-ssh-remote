@@ -1,12 +1,17 @@
 # Project instructions
 
+## Repository synchronization
+
+- Before starting any work, pull the latest changes from `origin` with `git pull --ff-only`. Preserve local edits; stop and resolve safely if the pull is blocked.
+- After each completed, validated piece of work, commit your changes and push to `origin` immediately. Work happens on multiple machines; do not leave finished work unsynchronized.
+
 ## Pi compatibility and releases
 
 - Test only against the latest stable Pi release from npm. Do not add a minimum-version test matrix or rely on stale installed dependencies.
 - Run `npm test` before every release. Its `pretest` installs the latest `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui`, then runs strict typechecking. The tests use an in-process SSH server, not a production host.
 - After successful checks, add or update the standalone README line `Tested against Pi <version>` using the actual installed coding-agent version. Never claim a version that was not tested. Keep this line current on every release and include it in the release commit.
 - Declare host-provided Pi libraries as peer dependencies, not runtime dependencies. Keep supported Pi version ranges accurate in `package.json`; they state compatibility, not an automatic update policy. Keep local development dependencies and the lockfile aligned with the tested release.
-- Keep this root `AGENTS.md` tracked and committed. Do not bump versions, publish packages, or push releases unless requested.
+- Keep this root `AGENTS.md` tracked and committed. Do not bump versions or publish packages unless requested.
 
 ## Code quality bar
 
