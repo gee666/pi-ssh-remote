@@ -72,6 +72,10 @@ export class RemoteConnection {
 	lastFailure: string | null = null;
 	onStateChange?: (state: "connected" | "reconnecting" | "failed") => void;
 
+	get isConnected(): boolean {
+		return this.client !== null && !this.disposed;
+	}
+
 	constructor(projectRef: RemoteProject) {
 		this.projectRef = projectRef;
 		const host = serverHost(projectRef.serverName, projectRef.server);

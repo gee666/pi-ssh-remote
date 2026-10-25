@@ -41,6 +41,9 @@ function harness(flags: string[], inherited = false) {
 	const commands = new Map<string, { handler: Function }>();
 	const messages: { content: string }[] = [];
 	const notifications: string[] = [];
+	let widget: { render(width: number): string[] } | undefined;
+	let widgetPlacement: string | undefined;
+	const statuses: unknown[] = [];
 	const selections: (string | undefined)[] = [];
 	const inputs: (string | undefined)[] = [];
 	let active = ["read", "write", "edit", "bash"];
@@ -54,10 +57,11 @@ function harness(flags: string[], inherited = false) {
 		setActiveTools(names: string[]) { active = names; },
 		on(name: string, handler: Function) { handlers.set(name, handler); },
 	} as unknown as ExtensionAPI;
-	const ctx = { hasUI: false, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus() {}, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
+	const ctx = { hasUI: false, waitForIdle: async () => {}, ui: { setTitle() {}, setStatus(...args: unknown[]) { statuses.push(args); }, setWidget(_key: string, factory: Function | undefined, options?: { placement: string }) { widget = factory?.({}, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }); widgetPlacement = options?.placement; }, notify(message: string) { notifications.push(message); }, select: async () => selections.shift(), input: async () => inputs.shift() } } as unknown as ExtensionContext;
 	extension(pi);
 	return {
 		pi, tools, registeredFlags, messages, notifications, selections, inputs, ctx, active: () => active,
+		widget: () => widget, widgetPlacement: () => widgetPlacement, statuses,
 		command: (name: string, args = "") => commands.get(name)!.handler(args, ctx),
 		start: () => handlers.get("session_start")!({}, ctx),
 		stop: () => handlers.get("session_shutdown")!({}, ctx),
@@ -114,6 +118,30 @@ test("startup modes and explicit opt-in", async (t) => {
 				} finally { await h.stop(); }
 			});
 		}
+		await t.test("SSH widget is one dim line below the editor only while connected", async (t) => {
+			const h = harness(["ssh"]);
+			let remote!: InstanceType<typeof import("../src/connection.ts").RemoteConnection>;
+			const resolve = RemoteFsRouter.prototype.resolveProjectCwd;
+			t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async function (this: InstanceType<typeof RemoteFsRouter>) {
+				remote = this.remote;
+				return resolve.call(this);
+			});
+			(h.ctx as { hasUI: boolean }).hasUI = true;
+			h.selections.push("test", `1. test (${remoteDir})`);
+			try {
+				assert.equal(h.widget(), undefined);
+				await h.start();
+				assert.equal(h.widgetPlacement(), "belowEditor");
+				assert.deepEqual(h.widget()!.render(1000), [`<dim>SSH: test:${remoteDir}</dim>`]);
+				assert.equal(h.widget()!.render(20).length, 1);
+				remote.invalidateCurrent();
+				assert.equal(h.widget(), undefined);
+				await h.run("bash", { command: "printf reconnected" });
+				assert.deepEqual(h.widget()!.render(1000), [`<dim>SSH: test:${remoteDir}</dim>`]);
+				assert.deepEqual(h.statuses, []);
+			} finally { await h.stop(); }
+			assert.equal(h.widget(), undefined);
+		});
 		await t.test("inherited project keeps legacy SSH-only mode", async () => {
 			const h = harness([], true);
 			try { await h.start(); assert.deepEqual([...h.tools.keys()].sort(), core.sort()); }
@@ -180,6 +208,8 @@ test("startup modes and explicit opt-in", async (t) => {
 		});
 		await t.test("first connection after offline startup is announced after path validation", async (t) => {
 			const h = harness(["ssh"]);
+			(h.ctx as { hasUI: boolean }).hasUI = true;
+			h.selections.push("test", `1. test (${remoteDir})`);
 			const resolve = RemoteFsRouter.prototype.resolveProjectCwd;
 			let first = true;
 			t.mock.method(RemoteFsRouter.prototype, "resolveProjectCwd", async function (this: InstanceType<typeof RemoteFsRouter>) {
@@ -189,11 +219,13 @@ test("startup modes and explicit opt-in", async (t) => {
 			try {
 				await h.start();
 				assert.equal(h.messages.length, 0);
+				assert.equal(h.widget(), undefined, "offline startup must not show a widget");
 				await h.run("bash", { command: "printf connected" });
 				const deadline = Date.now() + 2000;
 				while (h.messages.length === 0 && Date.now() < deadline) await new Promise((done) => setTimeout(done, 10));
 				assert.equal(h.messages.length, 1);
 				assert.equal(h.messages[0].content, `SSH connected to: test, CWD: ${remoteDir}`);
+				assert.deepEqual(h.widget()!.render(1000), [`<dim>SSH: test:${remoteDir}</dim>`]);
 				await h.run("bash", { command: "printf again" });
 				assert.equal(h.messages.length, 1);
 			} finally { await h.stop(); }

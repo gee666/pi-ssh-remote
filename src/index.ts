@@ -9,6 +9,7 @@
  */
 
 import { isDeepStrictEqual } from "node:util";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { BashOperations, ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
@@ -47,8 +48,20 @@ function redError(message: string): void {
 	console.error(`${RED}${message}${RESET}`);
 }
 
-function dimStatus(ctx: ExtensionContext, text: string): string {
-	return typeof ctx.ui?.theme?.fg === "function" ? ctx.ui.theme.fg("dim", text) : text;
+function updateSshWidget(ctx: ExtensionContext, remote: RemoteConnection | null): void {
+	if (!ctx.hasUI) return;
+	if (!remote?.isConnected) {
+		ctx.ui.setWidget("ssh-remote", undefined);
+		return;
+	}
+	ctx.ui.setWidget("ssh-remote", (_tui, theme) => ({
+		render: (width) => {
+			const text = remote.pathProblem ? `SSH path error: ${remote.projectRef.serverName}`
+				: `SSH: ${remote.projectRef.serverName}:${remote.remoteCwd}`;
+			return [truncateToWidth(theme.fg("dim", text.replace(/[\r\n]/g, " ")), width)];
+		},
+		invalidate() {},
+	}), { placement: "belowEditor" });
 }
 
 /**
@@ -212,7 +225,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			let needsPathValidation = false;
 			remote.onStateChange = (state) => {
 				if (state === "connected") {
-					ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${project.serverName}:${remote.remoteCwd}`));
+					updateSshWidget(ctx, remote);
 					// If startup happened while the server was unreachable, the
 					// configured path was never verified. Verify on first reconnect;
 					// an invalid path then fails all operations closed.
@@ -225,17 +238,15 @@ export default function piSshRemote(pi: ExtensionAPI) {
 						}).catch((error: unknown) => {
 							if (isFriendly(error) && error.kind === "remote-path") {
 								remote.pathProblem = error;
-								ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH path error: ${project.serverName}`));
+								updateSshWidget(ctx, remote);
 								if (ctx.hasUI) ctx.ui.notify(error.message, "error");
 							} else {
 								needsPathValidation = true;
 							}
 						});
 					}
-				} else if (state === "reconnecting") {
-					ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH reconnecting: ${project.serverName}`));
 				} else {
-					ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH unavailable: ${project.serverName}`));
+					updateSshWidget(ctx, null);
 				}
 			};
 
@@ -299,7 +310,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 
 			ctx.ui.setTitle(`SSH ${project.project.title}`);
 			if (!startupWarning) {
-				ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${project.serverName}:${remote.remoteCwd}`));
+				updateSshWidget(ctx, remote);
 				announceLocation(remote);
 			}
 		} catch (error) {
@@ -315,7 +326,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			if (mode !== "ssh") for (const tool of localTools(localCwd)) pi.registerTool(namedTool(tool, mode === "ssh-local" ? "-local" : "", `LOCAL machine. Working directory: ${localCwd}.`));
 			registerFailClosedTools(pi, localCwd, message, getSkillPaths, mode);
 			redError(message);
-			ctx.ui.setStatus("ssh-remote", dimStatus(ctx, "SSH setup failed"));
+			updateSshWidget(ctx, null);
 			if (ctx.hasUI) ctx.ui.notify(message, "error");
 		}
 		// Retire aliases bound to the previous connection or mode before exposing
@@ -380,7 +391,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 				} catch (error) {
 					mode = oldMode;
 					startupWarning = oldWarning;
-					if (connection) ctx.ui.setStatus("ssh-remote", dimStatus(ctx, `SSH: ${connection.projectRef.serverName}:${connection.remoteCwd}`));
+					updateSshWidget(ctx, connection);
 					ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				}
 			},
@@ -428,8 +439,9 @@ export default function piSshRemote(pi: ExtensionAPI) {
 		});
 	}
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		connection?.dispose();
+		updateSshWidget(ctx, null);
 		connection = null;
 	});
 
