@@ -266,6 +266,55 @@ test("startup modes and explicit opt-in", async (t) => {
 				assert.match(await h.run("bash", { command: "pwd" }), new RegExp(remoteDir));
 			} finally { await h.stop(); }
 		});
+		await t.test("missing CWD prompts, preserves declined input, and creates parents only with consent", async () => {
+			const h = harness(["ssh"]);
+			const original = await readFile(CONFIG_PATH, "utf8");
+			const missing = path.join(root, "new parent", "it's a folder");
+			try {
+				await h.start();
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				let prompts = 0;
+				h.ctx.ui.confirm = async (title, message) => {
+					assert.match(title, /doesn't exist, create it/);
+					assert.equal(message, missing);
+					assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+					return ++prompts === 2;
+				};
+				h.inputs.push(missing, missing);
+				const prefills: (string | undefined)[] = [];
+				h.ctx.ui.input = async (_title, prefill) => { prefills.push(prefill); return h.inputs.shift(); };
+				await h.command("ssh:cwd");
+				assert.equal(prompts, 2);
+				assert.equal(prefills[1], missing);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), missing);
+				assert.deepEqual(h.notifications, []);
+			} finally { await h.stop(); await writeFile(CONFIG_PATH, original); }
+		});
+		await t.test("creation failure reports an error and preserves the active directory", async (t) => {
+			const h = harness(["ssh"]);
+			try {
+				await h.start();
+				(h.ctx as { hasUI: boolean }).hasUI = true;
+				h.ctx.ui.confirm = async () => true;
+				const missing = path.join(root, "cannot-create", "child");
+				h.inputs.push(missing, remoteDir);
+				let inputs = 0;
+				h.ctx.ui.input = async (_title, prefill) => {
+					if (++inputs === 2) {
+						assert.equal(prefill, missing);
+						assert.match(h.notifications.at(-1)!, /Could not create folder.*Permission denied creating folder/);
+						assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+					}
+					return h.inputs.shift();
+				};
+				t.mock.method(RemoteFsRouter.prototype, "mkdirs", async () => { throw new Error("Permission denied creating folder"); });
+				await h.command("ssh:cwd");
+				assert.equal(inputs, 2);
+				assert.equal(h.notifications.length, 1);
+				assert.match(h.notifications[0], /Permission denied creating folder/);
+				assert.equal((await h.run("bash", { command: "pwd" })).trim(), remoteDir);
+			} finally { t.mock.restoreAll(); await h.stop(); }
+		});
 		await t.test("connections without folders prompt after connecting, save home, and allow new CWD input", async () => {
 			const original = await readFile(CONFIG_PATH, "utf8");
 			const config = JSON.parse(original);

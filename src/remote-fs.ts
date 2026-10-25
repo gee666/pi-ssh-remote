@@ -93,11 +93,11 @@ function sftpSetMode(sftp: SFTPWrapper, remotePath: string, mode: number): Promi
 }
 
 async function sftpMkdirRecursive(sftp: SFTPWrapper, dir: string): Promise<void> {
-	const normalized = path.posix.normalize(dir);
-	const segments = normalized.split("/").filter(Boolean);
-	let current = normalized.startsWith("/") ? "/" : "";
+	// Preserve symlink/.. traversal rather than normalizing it lexically.
+	const segments = dir.split("/").filter(Boolean);
+	let current = dir.startsWith("/") ? "/" : "";
 	for (const segment of segments) {
-		current = current === "" ? segment : path.posix.join(current, segment);
+		current = current === "" ? segment : `${current.replace(/\/$/, "")}/${segment}`;
 		try {
 			const stats = await sftpStat(sftp, current);
 			if (stats.isDirectory()) continue;

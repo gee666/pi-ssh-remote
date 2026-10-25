@@ -158,16 +158,38 @@ async function enterPath(ctx: ExtensionContext, project: RemoteProject, initial 
 		// Render the picker before opening SSH/SFTP. Its hints connect in the
 		// background; only submission waits for directory validation.
 		let prefill = initial;
+		const fs = new RemoteFsRouter(probe);
 		for (;;) {
 			const entered = await chooseRemotePath(ctx, probe, prefill, ".");
 			if (entered === undefined) throw new Error("SSH selection cancelled.");
 			try {
-				const remotePath = await new RemoteFsRouter(probe).resolveDirectory(entered || ".");
+				const remotePath = await fs.resolveDirectory(entered || ".");
 				return { ...project, project: { title: remotePath, path: remotePath }, label: `${project.serverName}: ${remotePath}` };
 			} catch (error) {
 				if (!isFriendly(error) || error.kind !== "remote-path") throw error;
-				ctx.ui.notify(error.message, "error");
 				prefill = entered;
+				// A path error can also mean an existing file. Only offer creation
+				// when the filesystem confirms that the candidate is missing.
+				const missing = await fs.stat(entered).then(() => false, (cause: unknown) => {
+					if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return true;
+					throw cause;
+				});
+				if (!missing) {
+					ctx.ui.notify(error.message, "error");
+					continue;
+				}
+				const create = await ctx.ui.confirm("Folder doesn't exist, create it?", entered, { signal: ctx.signal });
+				if (ctx.signal?.aborted) throw new Error("SSH selection cancelled.");
+				if (!create) continue;
+				try {
+					const home = await fs.resolveDirectory(".");
+					const target = entered.startsWith("/") ? entered : `${home}/${entered}`;
+					await fs.mkdirs(target);
+					const remotePath = await fs.resolveDirectory(target);
+					return { ...project, project: { title: remotePath, path: remotePath }, label: `${project.serverName}: ${remotePath}` };
+				} catch (cause) {
+					ctx.ui.notify(`Could not create folder '${entered}': ${cause instanceof Error ? cause.message : String(cause)}`, "error");
+				}
 			}
 		}
 	} finally {
