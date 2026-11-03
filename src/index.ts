@@ -508,7 +508,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			};
 		}
 		// Preserve advertised local skill paths, including project/package skills.
-		const replaced = event.systemPrompt.replaceAll(`Current working directory: ${localCwd}`, `Current working directory: ${remote.remoteCwd}`);
+		const replaced = event.systemPrompt.replace(`<cwd>\n${localCwd.replace(/\\/g, "/")}\n</cwd>`, `<cwd>\n${remote.remoteCwd}\n</cwd>`);
 		const warning = startupWarning
 			? ` The startup connection attempt failed (${startupWarning}), but the connection re-establishes automatically, so tool calls should be retried.`
 			: "";

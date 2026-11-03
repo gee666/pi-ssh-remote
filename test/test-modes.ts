@@ -66,7 +66,7 @@ function harness(flags: string[], inherited = false) {
 		start: () => handlers.get("session_start")!({}, ctx),
 		stop: () => handlers.get("session_shutdown")!({}, ctx),
 		bash: () => handlers.get("user_bash")!({}, ctx),
-		prompt: () => handlers.get("before_agent_start")!({ systemPrompt: `Current working directory: ${process.cwd()}` }, ctx)?.systemPrompt,
+		prompt: () => handlers.get("before_agent_start")!({ systemPrompt: `<cwd>\n${process.cwd().replace(/\\/g, "/")}\n</cwd>` }, ctx)?.systemPrompt,
 		async run(name: string, args: unknown) {
 			const result = await tools.get(name)!.execute("test", args, undefined, undefined, ctx);
 			return result.content.map((c) => c.type === "text" ? c.text : "").join("\n");
@@ -114,7 +114,11 @@ test("startup modes and explicit opt-in", async (t) => {
 					assert.equal(h.bash() === undefined, mode === "ssh-local-first");
 					assert.equal(h.messages.length, 1);
 					assert.equal(h.messages[0].content, `SSH connected to: test, CWD: ${remoteDir}`);
-					assert.ok(h.prompt().includes(`Current working directory: ${mode === "ssh-local-first" ? process.cwd() : remoteDir}`));
+					const expectedCwd = mode === "ssh-local-first" ? process.cwd().replace(/\\/g, "/") : remoteDir;
+					assert.ok(h.prompt().includes(`<cwd>\n${expectedCwd}\n</cwd>`));
+					if (mode !== "ssh-local-first") {
+						assert.ok(!h.prompt().includes(`<cwd>\n${process.cwd().replace(/\\/g, "/")}\n</cwd>`));
+					}
 				} finally { await h.stop(); }
 			});
 		}

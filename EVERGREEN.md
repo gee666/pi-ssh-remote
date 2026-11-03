@@ -26,7 +26,7 @@ pickers use public pi-tui components, input helpers, and keybindings.
 
 ## Internal Pi APIs
 None. No private imports, Pi source patching, or undocumented runtime access.
-Prompt cwd replacement does depend on Pi's generated prompt wording, not an API.
+Prompt cwd replacement depends on Pi's generated `<cwd>` section format, not an API.
 
 ## Weak points
 Pi prompt formatting and tool execution/schema changes can break remote intent.
@@ -50,7 +50,8 @@ host keys, cancellation, and exit codes. Tool-workflow integration joins actual
 Pi factories to SSH and checks the local-skill exception and project isolation.
 E2E requires model-issued read/write/edit/bash calls in inherited SSH and
 local-first modes, verifies a remote-only nonce and resulting files, and ensures
-the local launch directory stays untouched. Tested with installed Pi 1.4.0.
+the local launch directory stays untouched. Tested with installed Pi 1.5.0.
+Mode tests check Pi's `<cwd>` prompt section in remote and local-first modes.
 
 ## Relevant changelog topics
 Tool factory context/cwd and execution contracts; dynamic tool activation;
