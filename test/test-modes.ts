@@ -47,6 +47,7 @@ function harness(flags: string[], inherited = false) {
 	const selections: (string | undefined)[] = [];
 	const inputs: (string | undefined)[] = [];
 	let active = ["read", "write", "edit", "bash"];
+	let promptCwd = process.cwd();
 	const pi = {
 		registerFlag(name: string) { registeredFlags.push(name); },
 		registerCommand(name: string, command: { handler: Function }) { commands.set(name, command); },
@@ -66,7 +67,13 @@ function harness(flags: string[], inherited = false) {
 		start: () => handlers.get("session_start")!({}, ctx),
 		stop: () => handlers.get("session_shutdown")!({}, ctx),
 		bash: () => handlers.get("user_bash")!({}, ctx),
-		prompt: () => handlers.get("before_agent_start")!({ systemPrompt: `<cwd>\n${process.cwd().replace(/\\/g, "/")}\n</cwd>` }, ctx)?.systemPrompt,
+		prompt: () => {
+			const event = { systemPrompt: `<cwd>\n${process.cwd().replace(/\\/g, "/")}\n</cwd>`, systemPromptOptions: { cwd: process.cwd() } };
+			const result = handlers.get("before_agent_start")!(event, ctx);
+			promptCwd = event.systemPromptOptions.cwd;
+			return result?.systemPrompt;
+		},
+		promptCwd: () => promptCwd,
 		async run(name: string, args: unknown) {
 			const result = await tools.get(name)!.execute("test", args, undefined, undefined, ctx);
 			return result.content.map((c) => c.type === "text" ? c.text : "").join("\n");
@@ -116,6 +123,7 @@ test("startup modes and explicit opt-in", async (t) => {
 					assert.equal(h.messages[0].content, `SSH connected to: test, CWD: ${remoteDir}`);
 					const expectedCwd = mode === "ssh-local-first" ? process.cwd().replace(/\\/g, "/") : remoteDir;
 					assert.ok(h.prompt().includes(`<cwd>\n${expectedCwd}\n</cwd>`));
+					assert.equal(h.promptCwd().replace(/\\/g, "/"), expectedCwd);
 					if (mode !== "ssh-local-first") {
 						assert.ok(!h.prompt().includes(`<cwd>\n${process.cwd().replace(/\\/g, "/")}\n</cwd>`));
 					}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -62,10 +62,11 @@ test("installed Pi works on the remote project, not its local launch directory",
 			await writeFile(path.join(remote, "source.txt"), `${nonce} ALPHA\n`);
 			await writeFile(path.join(local, "source.txt"), "LOCAL_DECOY ALPHA\n");
 			const suffix = mode === "ssh" ? "" : "-ssh";
+			const sessionDir = path.join(root, "sessions", mode);
 			const output = await runPi([
 				"--no-extensions", "--extension", extension, "--no-mcp", "--no-skills",
 				"--no-prompt-templates", "--no-themes", "--no-context-files", "--offline",
-				"--session-dir", path.join(root, "sessions"), "--mode", "json", "--print", "--model", model,
+				"--session-dir", sessionDir, "--mode", "json", "--print", "--model", model,
 				...(mode === "ssh" ? [] : ["--ssh-local-first"]), "--",
 				`On the SSH project, perform these steps using exactly these tools: ` +
 				`read${suffix} source.txt; write${suffix} result.txt with exactly its contents; ` +
@@ -75,6 +76,14 @@ test("installed Pi works on the remote project, not its local launch directory",
 				...process.env, HOME: home, PI_CODING_AGENT_DIR: agentDir,
 				PI_CODING_AGENT_SSH_REMOTE_PROJECT: `evergreen::${remote}`,
 			});
+			const sessions = (await readdir(sessionDir, { recursive: true })).filter((file) => file.endsWith(".jsonl"));
+			assert.equal(sessions.length, 1);
+			const entries: unknown[] = (await readFile(path.join(sessionDir, sessions[0]), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+			const cwdSections = entries.filter(record).map((entry) => entry.message).filter(record)
+				.filter((message) => message.role === "system").map((message) => message.sections).filter(record)
+				.map((sections) => sections.cwd).filter((cwd) => typeof cwd === "string");
+			assert.ok(cwdSections.length > 0, "session must persist the structured prompt cwd");
+			for (const cwd of cwdSections) assert.equal(cwd, `<cwd>\n${mode === "ssh" ? remote : local}\n</cwd>`);
 			const events: unknown[] = output.trim().split("\n").map((line) => JSON.parse(line));
 			const starts = events.filter(record).filter((event) => event.type === "tool_execution_start");
 			for (const name of ["read", "write", "edit", "bash"]) {

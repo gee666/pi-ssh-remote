@@ -507,6 +507,9 @@ export default function piSshRemote(pi: ExtensionAPI) {
 					(startupWarning ? `SSH startup warning: ${startupWarning}. SSH tools reconnect automatically. ` : ""),
 			};
 		}
+		// Keep Pi's persisted prompt sections in sync with the forced text prompt.
+		// Otherwise the session still advertises the local launch directory.
+		event.systemPromptOptions.cwd = remote.remoteCwd;
 		// Preserve advertised local skill paths, including project/package skills.
 		const replaced = event.systemPrompt.replace(`<cwd>\n${localCwd.replace(/\\/g, "/")}\n</cwd>`, `<cwd>\n${remote.remoteCwd}\n</cwd>`);
 		const warning = startupWarning

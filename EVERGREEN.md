@@ -20,7 +20,10 @@ Hooks: `session_start`, `session_shutdown`, `before_agent_start`, `user_bash`.
 Exported read/write/edit/bash factories accept SSH operation adapters; exported
 search factories supply local mixed-mode tools. Tool execution context cwd is
 explicitly rebound for remote tools, since Pi otherwise supplies its local cwd.
-`systemPromptOptions.skills` identifies local skill paths. UI uses dialogs,
+`systemPromptOptions.skills` identifies local skill paths; `.cwd` keeps the
+persisted prompt's project directory remote except in local-first mode.
+Remote search overrides `execute()` (GrepOperations cannot run remote rg).
+Remote reads use the supported `readFile` fallback, not optional streaming. UI uses dialogs,
 notifications, title, and a connected-only widget below the editor; path/import
 pickers use public pi-tui components, input helpers, and keybindings.
 
@@ -50,8 +53,10 @@ host keys, cancellation, and exit codes. Tool-workflow integration joins actual
 Pi factories to SSH and checks the local-skill exception and project isolation.
 E2E requires model-issued read/write/edit/bash calls in inherited SSH and
 local-first modes, verifies a remote-only nonce and resulting files, and ensures
-the local launch directory stays untouched. Tested with installed Pi 1.5.0.
-Mode tests check Pi's `<cwd>` prompt section in remote and local-first modes.
+the local launch directory stays untouched. Tested with installed Pi 1.5.1.
+E2E also checks saved system-message cwd sections in both modes; the session
+header cwd intentionally remains local. Mode tests check both the forced `<cwd>`
+prompt text and structured prompt cwd in remote and local-first modes.
 
 ## Relevant changelog topics
 Tool factory context/cwd and execution contracts; dynamic tool activation;
