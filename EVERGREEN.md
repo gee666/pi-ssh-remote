@@ -53,10 +53,18 @@ host keys, cancellation, and exit codes. Tool-workflow integration joins actual
 Pi factories to SSH and checks the local-skill exception and project isolation.
 E2E requires model-issued read/write/edit/bash calls in inherited SSH and
 local-first modes, verifies a remote-only nonce and resulting files, and ensures
-the local launch directory stays untouched. Tested with installed Pi 1.5.1.
+the local launch directory stays untouched. Tested with installed Pi 1.5.2.
 E2E also checks saved system-message cwd sections in both modes; the session
 header cwd intentionally remains local. Mode tests check both the forced `<cwd>`
 prompt text and structured prompt cwd in remote and local-first modes.
+
+## Pi 1.5.2 compatibility
+Missing-session-cwd Continue/Fork/Cancel handling and import-copy cleanup are
+owned by Pi; this extension neither switches sessions nor copies session files.
+The session header cwd remains local, not the SSH project path. Continue's
+runtime-only local cwd and Fork's new local session do not change explicit remote
+tool cwd binding or structured remote prompt cwd. No runtime change is needed.
+Interactive missing-cwd choices are not covered by the CLI e2e suite.
 
 ## Relevant changelog topics
 Tool factory context/cwd and execution contracts; dynamic tool activation;
