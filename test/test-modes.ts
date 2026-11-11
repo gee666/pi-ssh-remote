@@ -16,6 +16,9 @@ const { CONFIG_PATH, INHERITED_PROJECT_ENV } = await import("../src/config.ts");
 const { FriendlySshError } = await import("../src/errors.ts");
 const { RemoteFsRouter } = await import("../src/remote-fs.ts");
 const oldInherited = process.env[INHERITED_PROJECT_ENV];
+const { INHERITED_CONFIG_ENV } = await import("../src/startup-config.ts");
+const oldConfigEnv = process.env[INHERITED_CONFIG_ENV];
+delete process.env[INHERITED_CONFIG_ENV];
 const remoteDir = path.join(root, "remote");
 await mkdir(remoteDir);
 await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
@@ -32,7 +35,7 @@ await writeFile(path.join(remoteDir, "remote.txt"), "REMOTE_ONLY\n");
 const localFile = path.join(root, "local.txt");
 await writeFile(localFile, "LOCAL_ONLY\n");
 
-function harness(flags: string[], inherited = false) {
+function harness(flags: string[], inherited = false, configPath?: string) {
 	if (inherited) process.env[INHERITED_PROJECT_ENV] = `test::${remoteDir}`;
 	else delete process.env[INHERITED_PROJECT_ENV];
 	const tools = new Map<string, ToolDefinition>();
@@ -52,7 +55,7 @@ function harness(flags: string[], inherited = false) {
 		registerFlag(name: string) { registeredFlags.push(name); },
 		registerCommand(name: string, command: { handler: Function }) { commands.set(name, command); },
 		sendMessage(message: { content: string }) { messages.push(message); },
-		getFlag(name: string) { return flags.includes(name); },
+		getFlag(name: string) { return name === "ssh-remote-config" ? configPath : flags.includes(name); },
 		registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
 		getActiveTools() { return active; },
 		setActiveTools(names: string[]) { active = names; },
@@ -130,6 +133,35 @@ test("startup modes and explicit opt-in", async (t) => {
 				} finally { await h.stop(); }
 			});
 		}
+		await t.test("dedicated settings enable SSH in RPC without selection or global config writes", async () => {
+			const file = path.join(root, "rpc-settings.json");
+			const raw = JSON.stringify({ rpc: { host: "127.0.0.1", port, user: "test", password: "testpass", projects: [{ title: "RPC", path: remoteDir }] } });
+			await writeFile(file, raw);
+			const globalBefore = await readFile(CONFIG_PATH, "utf8");
+			const h = harness([], true, path.relative(process.cwd(), file));
+			Object.assign(h.ctx, { hasUI: true, mode: "rpc" });
+			try {
+				await h.start();
+				assert.match(await h.run("read", { path: "remote.txt" }), /REMOTE_ONLY/);
+				assert.equal(h.messages[0].content, `SSH connected to: rpc, CWD: ${remoteDir}`);
+				assert.equal(await readFile(file, "utf8"), raw);
+				assert.equal(await readFile(CONFIG_PATH, "utf8"), globalBefore);
+				assert.equal(process.env[INHERITED_CONFIG_ENV], file);
+				const child = harness([]);
+				try { await child.start(); assert.match(await child.run("bash", { command: "pwd" }), new RegExp(remoteDir)); }
+				finally { await child.stop(); }
+			} finally { await h.stop(); delete process.env[INHERITED_CONFIG_ENV]; }
+		});
+		await t.test("bad startup settings fail closed in RPC without a picker", async () => {
+			for (const raw of ["{", "{}", JSON.stringify({ one: { projects: [] }, two: {} })]) {
+				const file = path.join(root, "bad-settings.json");
+				await writeFile(file, raw);
+				const h = harness([], false, file);
+				Object.assign(h.ctx, { hasUI: true, mode: "rpc" });
+				try { await h.start(); await assert.rejects(h.run("bash", { command: "pwd" }), /SSH remote mode is active but unavailable/); }
+				finally { await h.stop(); }
+			}
+		});
 		await t.test("remote write and edit ignore the local session context cwd", async () => {
 			const h = harness(["ssh"]);
 			const file = "context-workflow.txt";
@@ -621,6 +653,7 @@ test("startup modes and explicit opt-in", async (t) => {
 		server.dropConnections();
 		server.close();
 		if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+		if (oldConfigEnv === undefined) delete process.env[INHERITED_CONFIG_ENV]; else process.env[INHERITED_CONFIG_ENV] = oldConfigEnv;
 		if (oldInherited === undefined) delete process.env[INHERITED_PROJECT_ENV]; else process.env[INHERITED_PROJECT_ENV] = oldInherited;
 		await rm(root, { recursive: true, force: true });
 	}

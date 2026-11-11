@@ -25,6 +25,7 @@ import {
 	INHERITED_PROJECT_ENV,
 	formatInheritedProject,
 	loadProjects,
+	loadStartupProject,
 	matchInheritedProject,
 	matchProject,
 	saveProjectPath,
@@ -32,6 +33,7 @@ import {
 	type RemoteProject,
 } from "./config.ts";
 import { RemoteConnection } from "./connection.ts";
+import { INHERITED_CONFIG_ENV, startupConfigPath } from "./startup-config.ts";
 import { chooseRemotePath } from "./path-picker.ts";
 import { discoverPuttySessions } from "./putty.ts";
 import { choosePuttyConnections } from "./putty-import.ts";
@@ -112,6 +114,8 @@ function canReuse(remote: RemoteConnection | null | undefined, project: RemotePr
 }
 
 async function selectProject(pi: ExtensionAPI, ctx: ExtensionContext, interactive = false, active?: RemoteConnection | null): Promise<RemoteProject> {
+	const configPath = startupConfigPath(pi);
+	if (configPath) return loadStartupProject(configPath);
 	const projects = await loadProjects();
 	if (projects.length === 0) {
 		throw new Error(`SSH remote settings were not found. Add at least one server to ${CONFIG_PATH}.`);
@@ -213,6 +217,10 @@ export default function piSshRemote(pi: ExtensionAPI) {
 		type: "boolean",
 		default: false,
 	});
+	pi.registerFlag("ssh-remote-config", {
+		description: "Enable SSH using a read-only JSON file containing one server and one project, without prompts",
+		type: "string",
+	});
 	pi.registerFlag("ssh-remote-project", {
 		description: "Project selector for SSH modes in non-interactive mode (title, server name, path, or 1-based index)",
 		type: "string",
@@ -297,7 +305,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 				if (ctx.hasUI) ctx.ui.notify(`SSH remote is not reachable yet; pi will keep running and reconnect automatically. ${friendly.message}`, "error");
 			}
 
-			if (!startupWarning) {
+			if (!startupWarning && !startupConfigPath(pi)) {
 				try { await saveProjectPath(project.serverName, cwd); }
 				catch (error) { ctx.ui.notify(`SSH connected, but could not save directory: ${String(error)}`, "warning"); }
 			}
@@ -333,6 +341,8 @@ export default function piSshRemote(pi: ExtensionAPI) {
 			connection = remote;
 			if (previous !== remote) previous?.dispose();
 			fatalStartupError = null;
+			const configPath = startupConfigPath(pi);
+			if (configPath) process.env[INHERITED_CONFIG_ENV] = configPath;
 			process.env[INHERITED_PROJECT_ENV] = formatInheritedProject({ ...project, project: { ...project.project, path: remote.remoteCwd } });
 
 			ctx.ui.setTitle(`SSH ${project.project.title}`);
@@ -367,7 +377,7 @@ export default function piSshRemote(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const flags = (["ssh", "ssh-local", "ssh-local-first"] as const).filter((name) => pi.getFlag(name) === true);
-		if (flags.length === 0 && !process.env[INHERITED_PROJECT_ENV]) return;
+		if (flags.length === 0 && !process.env[INHERITED_PROJECT_ENV] && typeof pi.getFlag("ssh-remote-config") !== "string" && process.env[INHERITED_CONFIG_ENV] === undefined) return;
 		mode = flags.includes("ssh-local-first") ? "ssh-local-first" : flags.includes("ssh-local") ? "ssh-local" : "ssh";
 		startupWarning = null;
 		try {

@@ -7,7 +7,7 @@
 - Main risks: cwd binding, fail-closed setup, switching, transport loss, and prompt drift.
 
 ## Intent
-Start locally unless an SSH flag or inherited project requests remote execution.
+Start locally unless an SSH flag, dedicated settings file, or inherited project requests remote execution.
 Keep conversation context when switching servers/directories; failed or cancelled
 switches keep the previous location. Reuse connections, pin host keys, write
 atomically, reconnect file operations, and never silently rerun bash commands.
@@ -46,6 +46,8 @@ E2E uses `EVERGREEN_PI_BIN` or `pi` on PATH, stdin ignored, saved sessions,
 isolated config/home, and a loopback SSH server; credentials/catalog are copied
 from `PI_CODING_AGENT_DIR` or ~/.pi/agent and removed after the test.
 Unit tests protect config selection/import, skills, search, and picker behavior.
+The real Pi RPC startup test passes a single-target settings file without UI replies
+or global connection settings and verifies remote selection and read-only loading.
 Mode/lifecycle integration tests protect activation, switching without context
 loss, connection reuse, local opt-in, inherited selection, and fail-closed setup.
 Transport integration covers atomic/binary I/O, SFTP fallback, reconnect, auth,

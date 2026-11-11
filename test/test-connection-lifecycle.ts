@@ -116,6 +116,29 @@ async function authServer(t: TestContext, hold: boolean) {
 	return { port: (server.address() as net.AddressInfo).port, clients, passwords: () => passwords };
 }
 
+async function readyServer(t: TestContext) {
+	const clients = new Set<Connection>();
+	const server = new ssh2.Server({ hostKeys: [hostKey] }, (client) => {
+		clients.add(client);
+		client.on("error", () => {});
+		client.on("close", () => clients.delete(client));
+		client.on("authentication", (ctx) => ctx.accept());
+		client.on("ready", () => client.on("session", (accept) => {
+			accept().on("sftp", (acceptSftp) => {
+				acceptSftp();
+			});
+		}));
+	});
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	t.after(async () => {
+		for (const client of clients) client.end();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	});
+	return { port: (server.address() as net.AddressInfo).port };
+}
+
+const timeoutError = () => Object.assign(new Error("Keepalive timeout"), { level: "client-timeout" });
 const closedError = { kind: "connection", retryable: false, message: "SSH remote connection has been closed." };
 
 test("dispose during config preparation never starts a client", { timeout: 3_000 }, async (t) => {
@@ -203,6 +226,94 @@ test("retryable pre-ready errors close every failed client before retrying", { t
 	await waitFor(() => attempts.every((attempt) => attempt.closed), "failed retry clients lingered");
 	assert.equal(attempts.length, 3, "normal retry count must be preserved");
 	assert.ok(previousClosed, "retry started before the previous client closed");
+});
+
+test("keepalive timeout rejects shared SFTP opens and reconnects without stale state", { timeout: 5_000 }, async (t) => {
+	const server = await readyServer(t);
+	let opens = 0;
+	const attempts = observeClients(t, () => {
+		if (attempts.length === 1) t.mock.method(attempts[0].client, "sftp", function (this: Client) { opens++; return this; });
+	});
+	const remote = remoteFor(t, server.port);
+	const states: string[] = [];
+	remote.onStateChange = (state) => states.push(state);
+	const rejected = Promise.all([remote.getSftp(), remote.getSftp()].map((pending) => assert.rejects(pending, { retryable: true })));
+	await waitFor(() => opens === 1, "SFTP never opened");
+	attempts[0].client.emit("error", timeoutError());
+	await promptly(rejected);
+	assert.equal(remote.isConnected, false);
+	assert.ok(remote.lastFailure);
+	await waitFor(() => attempts[0].closed, "timed-out client was not destroyed");
+	const [first, second] = await promptly(Promise.all([remote.getSftp(), remote.getSftp()]));
+	assert.equal(first, second);
+	assert.equal(attempts.length, 2);
+	attempts[0].client.emit("error", timeoutError());
+	assert.equal(remote.isConnected, true, "late events killed the replacement");
+	assert.equal(remote.lastFailure, null);
+	assert.deepEqual(states, ["connected", "reconnecting", "connected"]);
+});
+
+test("a disconnect between ready and publication cannot cache a dead client", { timeout: 5_000 }, async (t) => {
+	const server = await readyServer(t);
+	const attempts = observeClients(t, () => {
+		if (attempts.length === 1) attempts[0].client.once("ready", () => attempts[0].client.emit("end"));
+	});
+	const remote = remoteFor(t, server.port);
+	await remote.getSftp();
+	assert.equal(attempts.length, 2);
+	assert.equal(remote.isConnected, true);
+});
+
+for (const event of [true, false]) {
+	test(`exec ${event ? "timeout event" : "callback failure"} never replays a command`, { timeout: 3_000 }, async (t) => {
+		const server = await readyServer(t);
+		const attempts = observeClients(t);
+		const remote = remoteFor(t, server.port);
+		await remote.getSftp();
+		const exec = t.mock.method(attempts[0].client, "exec", function (this: Client, _command: string, callback: (error: Error) => void) {
+			queueMicrotask(() => event ? this.emit("error", timeoutError()) : callback(timeoutError()));
+			return this;
+		});
+		await promptly(assert.rejects(remote.execChannel("append-to-ledger"), { retryable: true }));
+		assert.equal(exec.mock.callCount(), 1);
+		assert.equal(attempts.length, 1, "failed command triggered a reconnect/replay");
+		await remote.getSftp();
+		assert.equal(attempts.length, 2, "next operation did not recover");
+	});
+}
+
+test("a timed-out SFTP mutation is not replayed and its late failure cannot kill recovery", { timeout: 3_000 }, async (t) => {
+	const server = await readyServer(t);
+	const attempts = observeClients(t);
+	const remote = remoteFor(t, server.port);
+	await remote.getSftp();
+	let failOld: (error: Error) => void = () => assert.fail("mutation never started");
+	let calls = 0;
+	const rejected = assert.rejects(remote.withSftp("write", "/file", () => {
+		calls++;
+		queueMicrotask(() => attempts[0].client.emit("error", timeoutError()));
+		return new Promise<void>((_, reject) => { failOld = reject; });
+	}), { retryable: true });
+	await promptly(rejected);
+	await remote.getSftp();
+	failOld(timeoutError());
+	await delay(10);
+	assert.equal(calls, 1);
+	assert.equal(remote.isConnected, true);
+	assert.equal(attempts.length, 2);
+});
+
+test("read-only SFTP work retries once on its replacement transport", { timeout: 3_000 }, async (t) => {
+	const server = await readyServer(t);
+	const attempts = observeClients(t);
+	const remote = remoteFor(t, server.port);
+	let calls = 0;
+	assert.equal(await remote.withSftp("open", "/file", async () => {
+		if (++calls === 1) throw new Error("No response from server");
+		return "recovered";
+	}), "recovered");
+	assert.equal(calls, 2);
+	assert.equal(attempts.length, 2);
 });
 
 for (const synchronous of [false, true]) {

@@ -102,6 +102,44 @@ This variable also selects and enables a project when starting pi yourself. The 
 
 In non-interactive modes (including `-p` / `--print`), the project must be unambiguous: a single configured project, `--ssh-remote-project`, or `PI_CODING_AGENT_SSH_REMOTE_PROJECT`. A connection without saved paths uses its home directory. If it is ambiguous, the extension fails closed with a clear error instead of silently working on the local filesystem.
 
+### Unattended startup and RPC
+
+Save one connection and one folder in a dedicated JSON file, using the same format as the global config:
+
+```json
+{
+  "production": {
+    "hostName": "example.com",
+    "user": "deploy",
+    "identityFile": "~/.ssh/id_ed25519",
+    "projects": [{ "title": "App", "path": "/var/www/app" }]
+  }
+}
+```
+
+Pass the file when starting Pi:
+
+```bash
+pi --mode rpc --ssh-remote-config /path/to/connection.json
+```
+
+`--ssh-remote-config` enables SSH without needing `--ssh`. It always selects the file's single server and project without asking for a server or directory, even in RPC or terminal mode. You can combine it with `--ssh-local` or `--ssh-local-first` if you need local tools too. The extension must be installed or loaded with `-e /path/to/pi-ssh-remote/src/index.ts`.
+
+For example, from Node.js:
+
+```js
+import { spawn } from "node:child_process";
+
+const pi = spawn("pi", ["--mode", "rpc", "--ssh-remote-config", "/path/to/connection.json"], {
+  stdio: ["pipe", "pipe", "pipe"],
+});
+pi.stdin.write(JSON.stringify({ id: "work", type: "prompt", message: "Read README.md on the remote project." }) + "\n");
+```
+
+The file must contain exactly one server with exactly one explicit `projects` entry. Missing, malformed, or ambiguous files fail closed without opening a picker or using the global config. This file takes precedence over `--ssh-remote-project` and `PI_CODING_AGENT_SSH_REMOTE_PROJECT`. It is read-only: startup does not update it or save its directory into the global config. Relative file paths resolve from Pi's launch directory; `~` is supported. Relative private-key paths still resolve from the launch directory, not the settings file's directory. Prefer absolute remote folder paths so transient startup outages can recover.
+
+Subprocesses inherit the absolute settings-file path through `PI_CODING_AGENT_SSH_REMOTE_CONFIG`. You can also set this variable yourself; an explicit `--ssh-remote-config` takes precedence. The file must remain accessible to child Pi processes. Prefer `passwordEnv` or `passphraseEnv` over storing secrets in JSON, and restrict the file's permissions if it contains credentials. Host-key pinning still uses `~/.pi/agent/ssh-remote-known-hosts.json`.
+
 ## Configuration
 
 Create `~/.pi/agent/ssh-remote-config.json`:
@@ -152,12 +190,12 @@ MY_SSH_PASSWORD='secret' pi --ssh
 
 ## Behavior
 
-All SSH modes select a project, prompting in UI mode, and connect once to verify access and resolve the project directory. Plain `--ssh` registers remote-backed `read`, `write`, `edit`, and `bash`, routes user `!` commands over SSH, and changes the working directory advertised in the system prompt to the remote project. Mixed modes register both tool sets as listed above. `--ssh-local-first` keeps the advertised working directory and user `!` commands local.
+All SSH modes select a project, prompting in UI mode unless a dedicated startup file or explicit selector is supplied, and connect once to verify access and resolve the project directory. Plain `--ssh` registers remote-backed `read`, `write`, `edit`, and `bash`, routes user `!` commands over SSH, and changes the working directory advertised in the system prompt to the remote project. Mixed modes register both tool sets as listed above. `--ssh-local-first` keeps the advertised working directory and user `!` commands local.
 
 Connection lifecycle:
 
 - The connection stays open for the whole session and sends keepalives.
-- If it drops, the next operation transparently reconnects (with backoff) and retries the operation once. File operations are safe to retry; **bash commands are never silently rerun** — if the connection drops mid-command, the tool reports exactly that, including a warning that the command may or may not have completed.
+- If it drops or times out, pending operations fail instead of hanging on stale SSH callbacks. The next operation reconnects with backoff, without reloading the extension. Read-only SFTP operations can retry once on a replacement connection. Mutating SFTP operations and bash commands are never silently replayed, since the remote operation may already have taken effect. If a connection drops mid-command, the tool reports that the command may or may not have completed.
 - If the server is unreachable at startup but the project path is absolute, pi stays open and reconnects when the server is back.
 
 If setup fails, SSH-backed tools refuse operations with the setup error instead of silently falling back to local files. Advertised local skill reads remain available. In mixed modes, explicit local tools remain usable; with `--ssh-local-first`, unsuffixed tools and user `!` commands continue to run locally. Fail-closed setup errors include:

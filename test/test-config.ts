@@ -10,10 +10,26 @@ const oldUserProfile = process.env.USERPROFILE;
 process.env.HOME = root;
 process.env.USERPROFILE = root;
 const {
-	CONFIG_PATH, expandHome, formatInheritedProject, loadProjects,
+	CONFIG_PATH, expandHome, formatInheritedProject, loadProjects, loadStartupProject,
 	matchInheritedProject, matchProject, saveProjectPath, serverHost, truncateMiddle,
 } = await import("../src/config.ts");
 assert.equal(CONFIG_PATH, path.join(root, ".pi", "agent", "ssh-remote-config.json"));
+const { INHERITED_CONFIG_ENV, startupConfigPath } = await import("../src/startup-config.ts");
+
+test("startup file argument expands home and overrides inherited settings", () => {
+	const old = process.env[INHERITED_CONFIG_ENV];
+	try {
+		delete process.env[INHERITED_CONFIG_ENV];
+		assert.equal(startupConfigPath({ getFlag: () => undefined }), undefined);
+		assert.equal(startupConfigPath({ getFlag: () => "~/connection.json" }), path.join(root, "connection.json"));
+		process.env[INHERITED_CONFIG_ENV] = "inherited.json";
+		assert.equal(startupConfigPath({ getFlag: () => undefined }), path.resolve("inherited.json"));
+		assert.equal(startupConfigPath({ getFlag: () => "explicit.json" }), path.resolve("explicit.json"));
+		assert.throws(() => startupConfigPath({ getFlag: () => " " }), /non-empty/);
+	} finally {
+		if (old === undefined) delete process.env[INHERITED_CONFIG_ENV]; else process.env[INHERITED_CONFIG_ENV] = old;
+	}
+});
 
 beforeEach(async () => {
 	await mkdir(path.dirname(CONFIG_PATH), { recursive: true });
@@ -40,6 +56,22 @@ test("missing, blank, and empty configs still load no projects", async () => {
 		await writeFile(CONFIG_PATH, raw);
 		assert.deepEqual(await loadProjects(), []);
 	}
+});
+
+test("dedicated startup files require one explicit target and never use the global config", async () => {
+	const file = path.join(root, "startup.json");
+	await assert.rejects(loadStartupProject(file), /startup.json.*ENOENT/);
+	for (const config of [{}, { one: {} }, { one: { projects: [] } }, { one: { projects: [{ title: "A", path: "/a" }, { title: "B", path: "/b" }] } }, { one: {}, two: {} }]) {
+		await writeFile(file, JSON.stringify(config));
+		await assert.rejects(loadStartupProject(file), /exactly one server with exactly one project/);
+	}
+	await writeFile(file, "{");
+	await assert.rejects(loadStartupProject(file), /startup.json.*not valid JSON/);
+	await writeFile(file, JSON.stringify({ server: { passwordEnv: "SECRET", projects: [{ title: "App", path: "/app" }] } }));
+	const selected = await loadStartupProject(file);
+	assert.equal(selected.serverName, "server");
+	assert.equal(selected.project.path, "/app");
+	assert.equal(selected.server.passwordEnv, "SECRET");
 });
 
 test("servers without projects load a synthetic Home without changing their settings", async () => {

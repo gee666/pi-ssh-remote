@@ -75,14 +75,14 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
 
-function validateConfig(value: unknown): ConfigFile {
+function validateConfig(value: unknown, configPath = CONFIG_PATH): ConfigFile {
 	const root = asObject(value);
-	if (!root) throw new Error(`SSH remote settings in ${CONFIG_PATH} must be a JSON object of servers.`);
+	if (!root) throw new Error(`SSH remote settings in ${configPath} must be a JSON object of servers.`);
 
 	const config: ConfigFile = Object.create(null);
 	for (const [serverName, rawServer] of Object.entries(root)) {
 		const serverObj = asObject(rawServer);
-		if (!serverObj) throw new Error(`SSH remote server '${serverName}' in ${CONFIG_PATH} must be an object.`);
+		if (!serverObj) throw new Error(`SSH remote server '${serverName}' in ${configPath} must be an object.`);
 
 		const projects = serverObj.projects;
 		if (projects !== undefined && !Array.isArray(projects)) {
@@ -119,16 +119,16 @@ function validateConfig(value: unknown): ConfigFile {
 	return config;
 }
 
-function parseConfig(raw: string): ConfigFile {
+function parseConfig(raw: string, configPath = CONFIG_PATH): ConfigFile {
 	// Tolerate a UTF-8 BOM: PowerShell and Notepad routinely add one, and
 	// strict JSON.parse rejects it.
 	raw = raw.replace(/^\uFEFF/, "");
 	if (!raw.trim()) return Object.create(null);
 
 	try {
-		return validateConfig(JSON.parse(raw));
+		return validateConfig(JSON.parse(raw), configPath);
 	} catch (error) {
-		if (error instanceof SyntaxError) throw new Error(`SSH remote settings in ${CONFIG_PATH} are not valid JSON. Fix the file and try again.`);
+		if (error instanceof SyntaxError) throw new Error(`SSH remote settings in ${configPath} are not valid JSON. Fix the file and try again.`);
 		throw error;
 	}
 }
@@ -137,6 +137,25 @@ function remoteProject(serverName: string, server: ServerConfig, project: Projec
 	const host = serverHost(serverName, server);
 	const label = truncateMiddle(`${project.title} (${serverName} <${host}> - ${project.path})`);
 	return { serverName, server, project, label };
+}
+
+/** A dedicated startup file must select exactly one explicit server directory. */
+export async function loadStartupProject(filePath: string): Promise<RemoteProject> {
+	let raw: string;
+	try {
+		raw = await readFile(filePath, "utf8");
+	} catch (error) {
+		const code = error instanceof Error && "code" in error ? String(error.code) : "read failed";
+		throw new Error(`Cannot read SSH remote settings file '${filePath}': ${code}.`);
+	}
+	const config = parseConfig(raw, filePath);
+	const entries = Object.entries(config);
+	const entry = entries.length === 1 ? entries[0] : undefined;
+	const projects = entry?.[1].projects;
+	if (!entry || !projects || projects.length !== 1) {
+		throw new Error(`SSH remote settings file '${filePath}' must contain exactly one server with exactly one project path.`);
+	}
+	return remoteProject(entry[0], entry[1], projects[0]);
 }
 
 export async function loadProjects(): Promise<RemoteProject[]> {

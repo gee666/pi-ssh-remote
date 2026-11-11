@@ -1,9 +1,8 @@
 /**
  * Persistent SSH connection management built on the pure-JS `ssh2` library.
  *
- * One `RemoteConnection` owns a single ssh2 Client with keepalives. All
- * operations go through `withSftp`/`exec`, which lazily (re)connect with a
- * single-flight connect promise and retry once after transport failures.
+ * Operations lazily reconnect through a shared connection attempt. Only
+ * read-only SFTP operations can be replayed after a transport failure.
  *
  * No external binaries (ssh, sshpass) and nothing installed on the remote:
  * file operations use the SFTP subsystem, bash uses exec channels.
@@ -13,12 +12,10 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import ssh2 from "ssh2";
-import type { Client as ClientType, ClientChannel, ConnectConfig, SFTPWrapper } from "ssh2";
+import type { ClientChannel, ConnectConfig, SFTPWrapper } from "ssh2";
 import { CONFIG_PATH, KNOWN_HOSTS_PATH, expandHome, serverHost, type RemoteProject } from "./config.ts";
 import { FriendlySshError, classifyConnectionError, classifySftpError, isFriendly } from "./errors.ts";
-
-const { Client } = ssh2;
+import { ConnectionSession } from "./connection-session.ts";
 
 const READY_TIMEOUT_MS = 20_000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
@@ -53,12 +50,10 @@ function defaultAgent(): string | undefined {
 }
 
 export class RemoteConnection {
-	private client: ClientType | null = null;
-	private sftp: SFTPWrapper | null = null;
-	private connecting: Promise<ClientType> | null = null;
-	private handshaking: { client: ClientType; cancel: () => void } | null = null;
+	private session: ConnectionSession | null = null;
+	private connecting: Promise<ConnectionSession> | null = null;
+	private handshaking: ConnectionSession | null = null;
 	private cancelBackoff: (() => void) | null = null;
-	private sftpOpening: Promise<SFTPWrapper> | null = null;
 	/** Set when the configured project path turned out to be invalid; fails all operations closed. */
 	pathProblem: FriendlySshError | null = null;
 	private disposed = false;
@@ -73,7 +68,7 @@ export class RemoteConnection {
 	onStateChange?: (state: "connected" | "reconnecting" | "failed") => void;
 
 	get isConnected(): boolean {
-		return this.client !== null && !this.disposed;
+		return this.session !== null && this.session.active && !this.disposed;
 	}
 
 	constructor(projectRef: RemoteProject) {
@@ -148,29 +143,29 @@ export class RemoteConnection {
 	}
 
 	/** Lazily connect; concurrent callers share one in-flight attempt. */
-	private async ensureConnected(): Promise<ClientType> {
+	private async ensureConnected(): Promise<ConnectionSession> {
 		if (this.disposed) throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
-		if (this.client) return this.client;
+		if (this.session?.active) return this.session;
 		if (this.connecting) return this.connecting;
 
 		this.connecting = (async () => {
-			let lastError: unknown;
+			let lastError: FriendlySshError | undefined;
 			for (let attempt = 0; attempt < RECONNECT_BACKOFF_MS.length; attempt++) {
 				try {
 					if (this.disposed) throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
-					const client = await this.connectOnce();
+					const session = await this.connectOnce();
 					if (this.disposed) {
-						client.destroy();
-						throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
+						session.invalidate(new FriendlySshError("SSH remote connection has been closed.", "connection", false));
 					}
-					this.client = client;
+					session.checkActive();
+					this.session = session;
 					this.lastFailure = null;
 					this.onStateChange?.("connected");
-					return client;
+					return session;
 				} catch (error) {
 					lastError = this.normalizeConnectError(error);
-					this.lastFailure = (lastError as Error).message;
-					if ((isFriendly(lastError) && !lastError.retryable) || this.disposed) break;
+					this.lastFailure = lastError.message;
+					if (!lastError.retryable || this.disposed) break;
 					if (attempt < RECONNECT_BACKOFF_MS.length - 1) {
 						this.onStateChange?.("reconnecting");
 						await new Promise<void>((resolve) => {
@@ -206,91 +201,39 @@ export class RemoteConnection {
 		return classifyConnectionError(error, this.target, CONFIG_PATH);
 	}
 
-	private async connectOnce(): Promise<ClientType> {
+	private async connectOnce(): Promise<ConnectionSession> {
 		const config = await this.buildConnectConfig();
 		if (this.disposed) throw new FriendlySshError("SSH remote connection has been closed.", "connection", false);
-		return await new Promise<ClientType>((resolve, reject) => {
-			const client = new Client();
-			let settled = false;
-			const clearHandshake = () => {
-				if (this.handshaking?.client === client) this.handshaking = null;
-			};
-			const fail = (error: unknown) => {
-				if (settled) return;
-				settled = true;
-				clearHandshake();
-				reject(error);
-				// end() can leave a half-open socket waiting for an unresponsive peer.
-				try {
-					client.destroy();
-				} catch {
-					// Preserve the original connection error if teardown also fails.
-				}
-			};
-			this.handshaking = {
-				client,
-				cancel: () => fail(new FriendlySshError("SSH remote connection has been closed.", "connection", false)),
-			};
-			client.on("ready", () => {
-				if (settled) return;
-				settled = true;
-				clearHandshake();
-				// From now on, transport errors invalidate the cached client so
-				// the next operation reconnects.
-				client.on("error", () => this.invalidate(client));
-				client.on("close", () => this.invalidate(client));
-				client.on("end", () => this.invalidate(client));
-				resolve(client);
-			});
-			// Keep the error listener after settlement to absorb teardown errors.
-			client.on("error", fail);
-			client.on("close", () => {
-				fail(new FriendlySshError(`SSH connection to ${this.target} closed during handshake.`, "connection", true));
-			});
-			try {
-				client.connect(config);
-			} catch (error) {
-				fail(error);
+		const session = new ConnectionSession(this.target, (lost, error) => {
+			if (this.session !== lost) return;
+			this.session = null;
+			if (!this.disposed) {
+				this.lastFailure = error.message;
+				this.onStateChange?.("reconnecting");
 			}
 		});
+		this.handshaking = session;
+		try {
+			await session.connect(config);
+			return session;
+		} finally {
+			if (this.handshaking === session) this.handshaking = null;
+		}
 	}
 
-	private invalidate(client: ClientType): void {
-		if (this.client === client) {
-			this.client = null;
-			this.sftp = null;
-			if (!this.disposed) this.onStateChange?.("reconnecting");
-		}
+	private async sftpSession(): Promise<{ session: ConnectionSession; sftp: SFTPWrapper }> {
+		const session = await this.ensureConnected();
 		try {
-			client.end();
-		} catch {
-			// Already closed.
+			return { session, sftp: await session.getSftp() };
+		} catch (error) {
+			const friendly = this.classifySftpEstablishment(error, session);
+			if (friendly.retryable) session.invalidate(friendly);
+			throw friendly;
 		}
 	}
 
 	async getSftp(): Promise<SFTPWrapper> {
-		const client = await this.ensureConnected();
-		if (this.sftp && this.client === client) return this.sftp;
-		if (this.sftpOpening) return this.sftpOpening;
-		this.sftpOpening = (async () => {
-			const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
-				client.sftp((error, sftp) => (error ? reject(this.classifySftpEstablishment(error, client)) : resolve(sftp)));
-			});
-			this.sftp = sftp;
-			const forget = () => {
-				if (this.sftp === sftp) this.sftp = null;
-			};
-			sftp.on("close", forget);
-			// Without an error listener, an SFTP-session-level error would be an
-			// unhandled 'error' event and crash the whole process.
-			sftp.on("error", forget);
-			return sftp;
-		})();
-		try {
-			return await this.sftpOpening;
-		} finally {
-			this.sftpOpening = null;
-		}
+		return (await this.sftpSession()).sftp;
 	}
 
 	/**
@@ -299,11 +242,12 @@ export class RemoteConnection {
 	 * from genuine transport problems. The former triggers the shell-exec
 	 * file-operations fallback instead of failing.
 	 */
-	private classifySftpEstablishment(error: unknown, client: ClientType): FriendlySshError {
+	private classifySftpEstablishment(error: unknown, session: ConnectionSession): FriendlySshError {
 		const message = error instanceof Error ? error.message : String(error);
 		// If the channel itself opened but the subsystem failed (exit code /
 		// refusal), the transport is alive and exec channels can still be used.
-		const transportAlive = this.client === client;
+		if (isFriendly(error)) return error;
+		const transportAlive = session.active;
 		if (transportAlive && /establishing SFTP session|subsystem|refused|exit code|exit signal/i.test(message)) {
 			return new FriendlySshError(
 				`The server ${this.target} did not allow an SFTP session (${message}). Falling back to shell-based file operations over the SSH connection.`,
@@ -315,27 +259,21 @@ export class RemoteConnection {
 	}
 
 	/**
-	 * Run an SFTP operation. Retries once with a fresh connection if the
-	 * transport dropped mid-operation. SFTP file errors (ENOENT, EACCES) are
-	 * never retried.
+	 * Retry read-only SFTP operations once. A failed mutation may already have
+	 * taken effect remotely, so leave its outcome to the caller.
 	 */
 	async withSftp<T>(operation: string, remotePath: string, fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
 		if (this.pathProblem) throw this.pathProblem;
 		for (let attempt = 0; ; attempt++) {
-			let sftp: SFTPWrapper;
+			const { session, sftp } = await this.sftpSession();
 			try {
-				sftp = await this.getSftp();
-			} catch (error) {
-				throw this.normalizeConnectError(error);
-			}
-			try {
-				return await fn(sftp);
+				return await session.run(() => fn(sftp));
 			} catch (error) {
 				const friendly = classifySftpError(error, operation, remotePath);
 				const transport = isFriendly(friendly) && friendly.retryable;
 				if (transport) {
-					this.invalidateCurrent();
-					if (attempt === 0) continue;
+					session.invalidate(friendly);
+					if (attempt === 0 && ["open", "access", "resolve", "readdir", "probe"].includes(operation)) continue;
 				}
 				throw friendly;
 			}
@@ -343,34 +281,27 @@ export class RemoteConnection {
 	}
 
 	invalidateCurrent(): void {
-		const client = this.client;
-		if (client) this.invalidate(client);
+		this.session?.invalidate(new FriendlySshError(`SSH connection to ${this.target} was interrupted.`, "connection", true));
 	}
 
-	/** Open an exec channel; retries connection establishment, not the command. */
+	/** Retry connecting, never a command whose acceptance may have been lost. */
 	async execChannel(command: string): Promise<ClientChannel> {
 		if (this.pathProblem) throw this.pathProblem;
-		for (let attempt = 0; ; attempt++) {
-			const client = await this.ensureConnected();
-			try {
-				return await new Promise<ClientChannel>((resolve, reject) => {
-					client.exec(command, (error, stream) => (error ? reject(error) : resolve(stream)));
-				});
-			} catch (error) {
-				const friendly = classifyConnectionError(error, this.target, CONFIG_PATH);
-				if (friendly.retryable && attempt === 0) {
-					this.invalidateCurrent();
-					continue;
-				}
-				throw friendly;
-			}
+		const session = await this.ensureConnected();
+		try {
+			return await session.exec(command);
+		} catch (error) {
+			const friendly = classifyConnectionError(error, this.target, CONFIG_PATH);
+			if (friendly.retryable) session.invalidate(friendly);
+			throw friendly;
 		}
 	}
 
 	dispose(): void {
 		this.disposed = true;
-		this.handshaking?.cancel();
+		const closed = new FriendlySshError("SSH remote connection has been closed.", "connection", false);
+		this.handshaking?.invalidate(closed);
 		this.cancelBackoff?.();
-		this.invalidateCurrent();
+		this.session?.invalidate(closed);
 	}
 }
